@@ -23,18 +23,30 @@ fn main() {
         Err(e) => eprintln!("Error while checking option combinations validity {e}"),
     }
 
+    let file_extensions = options
+        .get("file-extensions")
+        .expect("should provide the --file-extensions flag");
+    let file_extensions: Vec<String> = file_extensions
+        .trim()
+        .split(",")
+        .map(String::from)
+        .collect();
+
+    let ignored_dirs = options
+        .get("ignored-dirs")
+        .expect("should provide the --ignored-dirs flag");
+    let ignored_dirs: Vec<String> = ignored_dirs.trim().split(",").map(String::from).collect();
     let project_files = get_files_from_directory_recursively(
         options
             .get("source")
             .expect("should provide --source flag")
             .into(),
-        &vec!["target".into()],
-        &vec!["rs".to_owned()],
+        &ignored_dirs,
+        &file_extensions,
     );
 
     println!("Will process {} project files", project_files.len());
 
-    //O MANOS GAMIETAI ```comments-2.0 4 aslkjdahsdjkhasd```
     let comment_data_of_files: Vec<models::CommentData> = project_files
         .iter()
         .flat_map(|p| parser::parse_file(p, BufReader::new(File::open(p).unwrap())))
@@ -190,9 +202,7 @@ mod parser {
 
     use super::{models, storage};
     use std::collections::HashMap;
-    use std::fs::File;
     use std::io::prelude::*;
-    use std::io::{self, BufReader};
     use std::path::{Path, PathBuf};
 
     //we will be ignoring the inline comments probably
@@ -259,11 +269,6 @@ mod parser {
         }
     }
 
-    fn get_files_in_directory(directory: &Path) -> Vec<&Path> {
-        assert!(directory.is_dir());
-        todo!()
-    }
-
     //this does not belong here
     fn apply_integrity_rules(
         parsed_comments: Vec<Vec<(PathBuf, CommentData)>>,
@@ -271,88 +276,72 @@ mod parser {
         return Ok(());
     }
 
-    pub fn parse_project_in(directory: &Path) -> Vec<Vec<(PathBuf, CommentData)>> {
-        assert!(directory.is_dir());
-        //this should call parse_file
-        return Vec::new();
-    }
-
     pub fn parse_file<T: BufRead>(file: &Path, reader: T) -> Vec<CommentData> {
-        // let f = File::open(file);
-        // assert!(f.is_ok());
-        // let reader = BufReader::new(f.unwrap());
         let mut parser_state = ParserState::empty();
         let mut current_comment_data = CommentData::empty();
         let mut result = Vec::new();
         current_comment_data.file = file.into();
-        let mut comments_number = 0;
         for l in reader.lines() {
-            //this should be extracted to a different function
             if let Ok(current_line) = l {
                 println!("Current line: {current_line}\n");
                 let current_line = current_line.trim_start();
                 if current_line.starts_with("/*") {
-                    comments_number += 1;
                     parser_state.set_state(ParserPositionType::IN_MULTILINE_COMMENT);
-                    let comment: String = current_line.to_string().chars().skip(2).collect();
+                    let comment: String =
+                        current_line.to_string().chars().skip("/*".len()).collect();
                     current_comment_data.push_comment(&comment);
                     println!("Entering multiline comment\n");
-                } else if current_line.starts_with("//") {
-                    comments_number += 1;
+                    continue;
+                }
+                if current_line.starts_with("//") {
                     println!("Entering single line comment\n");
-                    let comment: String = current_line.to_string().chars().skip(2).collect();
+                    let comment: String =
+                        current_line.to_string().chars().skip("//".len()).collect();
                     current_comment_data.push_comment(&comment);
                     parser_state.set_state(ParserPositionType::IN_SINGLE_LINE_COMMENT);
-                } else if current_line.starts_with("*/") {
+                    continue;
+                }
+                if current_line.starts_with("*/") {
                     println!("Exiting multiline comment\n");
                     parser_state.set_state(ParserPositionType::NONE);
-                } else {
-                    if parser_state.position == ParserPositionType::IN_MULTILINE_COMMENT {
-                        comments_number += 1;
-                        current_comment_data.push_comment(current_line.trim_start());
-                        continue;
-                    }
+                    continue;
+                }
+                if parser_state.position == ParserPositionType::IN_MULTILINE_COMMENT {
+                    current_comment_data.push_comment(current_line.trim_start());
+                    continue;
+                }
 
-                    if parser_state.position != ParserPositionType::NOT_IN_A_COMMENT {
-                        parser_state.set_state(ParserPositionType::NOT_IN_A_COMMENT);
-                    }
+                if parser_state.position != ParserPositionType::NOT_IN_A_COMMENT {
+                    parser_state.set_state(ParserPositionType::NOT_IN_A_COMMENT);
+                }
 
-                    if parser_state.previous == ParserPositionType::IN_SINGLE_LINE_COMMENT
-                        || parser_state.previous == ParserPositionType::IN_MULTILINE_COMMENT
-                    {
-                        //means it is unstamped as we are currently in a line of code
+                println!("Entering a line of code\n");
+                if parser_state.previous == ParserPositionType::IN_SINGLE_LINE_COMMENT
+                    || parser_state.previous == ParserPositionType::IN_MULTILINE_COMMENT
+                {
+                    let is_stamped = current_comment_data.lines_of_code_referenced > 0;
+                    if !is_stamped {
+                        println!("Pushing an unstamped comment to the result\n");
+                        //an unstamped comment does not need lines of code, just add it to the db
                         //```comments-2.0 1```
-                        if current_comment_data.lines_of_code_referenced == 0 {
-                            println!("Pushing a comment to the result\n");
-                            result.push(current_comment_data);
-                            current_comment_data = CommentData::empty();
-                            parser_state.set_state(ParserPositionType::NOT_IN_A_COMMENT);
-                            continue;
-                        }
-                    }
+                        result.push(current_comment_data);
+                        current_comment_data = CommentData::empty();
+                        //this is important as if we dont do this we just keep adding comments
+                        //for every line of code ```comments-2.0 1```
+                        parser_state.set_state(ParserPositionType::NOT_IN_A_COMMENT);
+                        continue;
+                    };
 
-                    println!("Entering a line of code\n");
-                    if parser_state.previous == ParserPositionType::IN_SINGLE_LINE_COMMENT
-                        || parser_state.previous == ParserPositionType::IN_MULTILINE_COMMENT
-                    {
-                        //this means it is stamped ```comments-2.0 3```
-                        if current_comment_data.lines_of_code_referenced > 0
-                            && current_comment_data.lines_of_code_read
-                                == current_comment_data.lines_of_code_referenced
-                        {
-                            //Hello World
-                            //This is the first comment of the app ```comments-2.0 3```
-                            println!("Pushing a comment to the result\n");
-                            result.push(current_comment_data);
-                            current_comment_data = CommentData::empty();
-                        } else if current_comment_data.lines_of_code_referenced > 0
-                            && current_comment_data.lines_of_code_read
-                                != current_comment_data.lines_of_code_referenced
-                        {
-                            println!("Pushing code to existing comment");
-                            current_comment_data.lines_of_code_read += 1;
-                            current_comment_data.push_code(current_line.trim_start());
-                        }
+                    let has_lines_of_code_left_to_read = current_comment_data.lines_of_code_read
+                        != current_comment_data.lines_of_code_referenced;
+                    if !has_lines_of_code_left_to_read {
+                        println!("Pushing a stamped comment to the result\n");
+                        result.push(current_comment_data);
+                        current_comment_data = CommentData::empty();
+                    } else {
+                        println!("Pushing code to existing comment");
+                        current_comment_data.lines_of_code_read += 1;
+                        current_comment_data.push_code(current_line.trim_start());
                     }
                 }
             } else {
@@ -364,7 +353,6 @@ mod parser {
             result.push(current_comment_data);
         }
 
-        println!("Lines of comments are: {comments_number}");
         println!("Comments found: {}", result.len());
         return result;
     }
@@ -373,7 +361,6 @@ pub mod models {
     use std::{hash::Hash, path::PathBuf};
 
     // i need a different struct for the parser and the db
-
     pub struct CommentData {
         pub location: SourceRange,
         //used in the generation of the hash
