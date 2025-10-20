@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::{env, panic, u64};
 
 use storage::SqliteDB;
-fn main() {
+fn main() -> std::process::ExitCode {
     use parser::Parser;
     use storage::Storage;
     let program_args = env::args();
@@ -51,8 +51,21 @@ fn main() {
         .iter()
         .flat_map(|p| parser::parse_file(p, BufReader::new(File::open(p).unwrap())))
         .collect();
-
-    println!("The project comments are: {}", comment_data_of_files.len());
+    let result = comment_data_of_files.len();
+    println!("The project comments are: {}\n", result);
+    let db_option = options.get("db");
+    let db_file = match db_option {
+        None => "comments.sqlite".to_owned(),
+        Some(db) => db.to_owned(),
+    };
+    println!("Storing them in db: {db_file}\n");
+    let result = storage::store_in_db(&db_file, comment_data_of_files);
+    if result.is_err() {
+        println!("Something went wrong when trying to store data in the database");
+        return std::process::ExitCode::FAILURE;
+    } else {
+        return std::process::ExitCode::SUCCESS;
+    }
 }
 
 fn get_files_from_directory_recursively(
@@ -131,7 +144,7 @@ fn are_args_valid(args: &HashMap<String, String>) -> Result<(), &'static str> {
 
 mod storage {
     use super::models;
-    use rusqlite::Connection;
+    use rusqlite::{Connection, OpenFlags};
     use std::path::PathBuf;
     pub struct SqliteDB {
         file: PathBuf,
@@ -141,6 +154,90 @@ mod storage {
         pub fn new(file: PathBuf) -> Result<Self, rusqlite::Error> {
             let conn = Connection::open(&file)?;
             return Ok(Self { file });
+        }
+    }
+
+    pub fn store_in_db(file: &String, data: Vec<models::CommentData>) -> Result<(), String> {
+        let conn = Connection::open_with_flags(
+            PathBuf::from(file),
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_URI
+                | OpenFlags::SQLITE_OPEN_CREATE
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        );
+        match conn {
+            Err(e) => return Err(e.to_string()),
+            Ok(mut conn) => {
+                println!(
+                    "A connection was successfully made in {}\n ",
+                    conn.path().unwrap()
+                );
+
+                let initialize_db_command = conn.prepare(
+                    "
+CREATE TABLE IF NOT EXISTS Comments(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    contents TEXT NOT NULL,
+    code TEXT,
+    contents_hash TEXT,
+    code_hash TEXT,
+    file_path TEXT NOT NULL,
+    row INTEGER,              -- starting line or row number in file
+    column INTEGER,           -- column position in file
+    lines_of_code INTEGER,    -- how many lines of code the comment refers to
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+",
+                );
+                let res = initialize_db_command
+                    .expect("Something went wrong when trying to create tables")
+                    .execute([]);
+
+                let mut index_initialisation = conn.prepare(
+                    "CREATE INDEX IF NOT EXISTS idx_comments_file_path ON Comments(file_path);",
+                );
+
+                index_initialisation
+                    .expect("Something went wrong when trying to create index statement for db")
+                    .execute([])
+                    .expect("Could not execute index creation statement");
+                if res.is_err() {
+                    return Err(res.err().unwrap().to_string());
+                }
+
+                //i manually start and stop the transaction in order to
+                //make it faster by avoiding too many transactions ```comments-2.0 1```
+                let tx = conn.transaction().unwrap();
+                {
+                    let mut stmt = tx
+                        .prepare(
+                            "INSERT INTO Comments
+            (contents, code, contents_hash, code_hash, file_path, row, column, lines_of_code)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                        )
+                        .expect("something went wrong when preparing hash");
+
+                    for comment in data {
+                        let file_path_str = comment.file.to_str().unwrap();
+
+                        stmt.execute([
+                            comment.raw_contents,
+                            comment.code_it_refers_to,
+                            comment.hash_from_comment,
+                            comment.computed_hash,
+                            file_path_str.to_string(),
+                            comment.location.start.row.to_string(),
+                            comment.location.start.column.to_string(),
+                            comment.lines_of_code_referenced.to_string(),
+                        ])
+                        .expect("Something went wrong when trying to execute an INSERT statement");
+                        println!("inserted into db");
+                    }
+                }
+                tx.commit().unwrap();
+
+                return Ok(());
+            }
         }
     }
 
@@ -348,7 +445,7 @@ mod parser {
                 break;
             }
         }
-        //when it finishes we just pick up any relevant comment
+        //when it finishes we just pick up any relevant comment ```comments-2.0 3```
         if current_comment_data.raw_contents.len() > 0 {
             result.push(current_comment_data);
         }
@@ -457,9 +554,9 @@ pub mod models {
     }
 
     pub struct SourceLocation {
-        row: u64,
+        pub row: u64,
         //column will now not be used yet
-        column: u64,
+        pub column: u64,
     }
 
     impl SourceLocation {
@@ -473,8 +570,8 @@ pub mod models {
     }
 
     pub struct SourceRange {
-        start: SourceLocation,
-        end: SourceLocation,
+        pub start: SourceLocation,
+        pub end: SourceLocation,
     }
 }
 
