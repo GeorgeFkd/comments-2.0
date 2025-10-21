@@ -4,12 +4,10 @@ use std::fs::{File, read_dir};
 use std::io::BufReader;
 use std::iter::Iterator;
 use std::path::{Path, PathBuf};
-use std::{env, panic, u64};
+use std::time::Instant;
+use std::{env, fs};
 
-use storage::SqliteDB;
 fn main() -> std::process::ExitCode {
-    use parser::Parser;
-    use storage::Storage;
     let program_args = env::args();
 
     let options = parse_program_args(program_args)
@@ -32,6 +30,7 @@ fn main() -> std::process::ExitCode {
         .map(String::from)
         .collect();
 
+    //for each language i could write the ignored-dirs myself ```comments-2.0 3```
     let ignored_dirs = options
         .get("ignored-dirs")
         .expect("should provide the --ignored-dirs flag");
@@ -46,11 +45,25 @@ fn main() -> std::process::ExitCode {
     );
 
     println!("Will process {} project files", project_files.len());
+    let threads = get_threads_to_use(project_files.len() as u64);
+    if threads.is_some() {
+        println!("Will use {} threads", threads.unwrap());
+    } else {
+        println!("Will be single threaded")
+    }
 
+    let start = Instant::now();
     let comment_data_of_files: Vec<models::CommentData> = project_files
         .iter()
         .flat_map(|p| parser::parse_file(p, BufReader::new(File::open(p).unwrap())))
         .collect();
+    let end = Instant::now();
+    //50k files in 13 seconds
+    println!(
+        "Completed comments parsing in {:?}",
+        end.duration_since(start)
+    );
+
     let result = comment_data_of_files.len();
     println!("The project comments are: {}\n", result);
     let db_option = options.get("db");
@@ -58,14 +71,53 @@ fn main() -> std::process::ExitCode {
         None => "comments.sqlite".to_owned(),
         Some(db) => db.to_owned(),
     };
+
     println!("Storing them in db: {db_file}\n");
-    let result = storage::store_in_db(&db_file, comment_data_of_files);
+    let start = Instant::now();
+    let result = storage::store_in_sqlite(&db_file, &comment_data_of_files, 500);
     if result.is_err() {
         println!("Something went wrong when trying to store data in the database");
         return std::process::ExitCode::FAILURE;
     } else {
+        let end = Instant::now();
+        println!(
+            "Storing them to sqlite needed {:?}",
+            end.duration_since(start)
+        );
         return std::process::ExitCode::SUCCESS;
     }
+}
+
+fn get_threads_to_use(files_to_process: u64) -> Option<usize> {
+    if files_to_process < 1000 {
+        return None;
+    };
+    let threads: usize = std::thread::available_parallelism().unwrap().into();
+    println!("Logical cpus are: {threads}");
+
+    let os = env::consts::OS;
+    assert!(os == "linux");
+    let meminfo_contents = fs::read_to_string(Path::new("/proc/meminfo")).unwrap();
+    //the records are in the form <label>:\t number kB
+    let available_memory = meminfo_contents
+        .lines()
+        .into_iter()
+        .find(|l| l.starts_with("MemAvailable"))
+        .unwrap()
+        .split(":")
+        .skip(1)
+        .take(1)
+        .last()
+        .unwrap();
+    let available_memory: Vec<&str> = available_memory.trim_start().split(" ").collect();
+    let available_memory: usize = available_memory
+        .get(0)
+        .unwrap()
+        .parse()
+        .expect("Could not parse /proc/meminfo file");
+    println!("System has {available_memory} kB memory");
+
+    return Some(threads);
 }
 
 fn get_files_from_directory_recursively(
@@ -73,7 +125,6 @@ fn get_files_from_directory_recursively(
     ignored_dirs: &Vec<String>,
     file_extensions_allowed: &Vec<String>,
 ) -> Vec<PathBuf> {
-    println!("The dir is: {:?}", dir);
     //the performance might be bad
     assert!(dir.is_dir());
     match read_dir(dir) {
@@ -144,37 +195,54 @@ fn are_args_valid(args: &HashMap<String, String>) -> Result<(), &'static str> {
 
 mod storage {
     use super::models;
-    use rusqlite::{Connection, OpenFlags};
+    use rusqlite::{Connection, OpenFlags, params};
     use std::path::PathBuf;
+
+    //might add a connection with a mutex here
     pub struct SqliteDB {
         file: PathBuf,
     }
 
     impl SqliteDB {
-        pub fn new(file: PathBuf) -> Result<Self, rusqlite::Error> {
-            let conn = Connection::open(&file)?;
-            return Ok(Self { file });
+        pub fn new(file: PathBuf) -> Self {
+            return Self { file };
         }
     }
 
-    pub fn store_in_db(file: &String, data: Vec<models::CommentData>) -> Result<(), String> {
-        let conn = Connection::open_with_flags(
-            PathBuf::from(file),
-            OpenFlags::SQLITE_OPEN_READ_WRITE
-                | OpenFlags::SQLITE_OPEN_URI
-                | OpenFlags::SQLITE_OPEN_CREATE
-                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        );
-        match conn {
-            Err(e) => return Err(e.to_string()),
-            Ok(mut conn) => {
-                println!(
-                    "A connection was successfully made in {}\n ",
-                    conn.path().unwrap()
-                );
+    pub fn store_in_sqlite(
+        file: &String,
+        data: &Vec<models::CommentData>,
+        records_per_db_transaction: usize,
+    ) -> Result<(), String> {
+        let db = SqliteDB::new(file.into());
+        db.store_batch(data, records_per_db_transaction)
+    }
 
-                let initialize_db_command = conn.prepare(
-                    "
+    impl Storage for SqliteDB {
+        fn store_batch(
+            &self,
+            data: &Vec<models::CommentData<'_>>,
+            records_per_transaction: usize,
+        ) -> Result<(), String> {
+            let conn = Connection::open_with_flags(
+                &self.file,
+                OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | OpenFlags::SQLITE_OPEN_URI
+                    | OpenFlags::SQLITE_OPEN_CREATE
+                    | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            );
+            match conn {
+                Err(e) => return Err(e.to_string()),
+                Ok(mut conn) => {
+                    println!(
+                        "A connection was successfully made in {}\n ",
+                        conn.path().unwrap()
+                    );
+
+                    //i dont like the created_at timestamp it is useless, it should have an author
+                    //instead and a time of change ```comments-2.0 1```
+                    let initialize_db_command = conn.prepare(
+                        "
 CREATE TABLE IF NOT EXISTS Comments(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     contents TEXT NOT NULL,
@@ -186,64 +254,93 @@ CREATE TABLE IF NOT EXISTS Comments(
     column INTEGER,           -- column position in file
     lines_of_code INTEGER,    -- how many lines of code the comment refers to
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);
-",
-                );
-                let res = initialize_db_command
-                    .expect("Something went wrong when trying to create tables")
-                    .execute([]);
+);",
+                    );
+                    let res = initialize_db_command
+                        .expect("Something went wrong when trying to create tables")
+                        .execute([]);
 
-                let mut index_initialisation = conn.prepare(
-                    "CREATE INDEX IF NOT EXISTS idx_comments_file_path ON Comments(file_path);",
-                );
+                    let mut index_initialisation = conn.prepare(
+                        "CREATE INDEX IF NOT EXISTS idx_comments_file_path ON Comments(file_path);",
+                    );
 
-                index_initialisation
-                    .expect("Something went wrong when trying to create index statement for db")
-                    .execute([])
-                    .expect("Could not execute index creation statement");
-                if res.is_err() {
-                    return Err(res.err().unwrap().to_string());
-                }
-
-                //i manually start and stop the transaction in order to
-                //make it faster by avoiding too many transactions ```comments-2.0 1```
-                let tx = conn.transaction().unwrap();
-                {
-                    let mut stmt = tx
-                        .prepare(
-                            "INSERT INTO Comments
+                    index_initialisation
+                        .expect("Something went wrong when trying to create index statement for db")
+                        .execute([])
+                        .expect("Could not execute index creation statement");
+                    if res.is_err() {
+                        return Err(res.err().unwrap().to_string());
+                    }
+                    //the chunk size is 100 arbitrarily, to avoid long uncommitted transactions
+                    //```comments-2.0 1```
+                    for chunk in data.chunks(records_per_transaction) {
+                        //i manually start and stop the transaction in order to
+                        //make it faster by avoiding too many transactions ```comments-2.0 1```
+                        let tx = conn.transaction().unwrap();
+                        {
+                            let mut stmt = tx
+                                .prepare(
+                                    "INSERT INTO Comments
             (contents, code, contents_hash, code_hash, file_path, row, column, lines_of_code)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                        )
-                        .expect("something went wrong when preparing hash");
+                                )
+                                .expect("something went wrong when preparing hash");
 
-                    for comment in data {
-                        let file_path_str = comment.file.to_str().unwrap();
+                            for comment in chunk {
+                                let file_path_str = comment.file.to_str().unwrap();
 
-                        stmt.execute([
-                            comment.raw_contents,
-                            comment.code_it_refers_to,
-                            comment.hash_from_comment,
-                            comment.computed_hash,
-                            file_path_str.to_string(),
-                            comment.location.start.row.to_string(),
-                            comment.location.start.column.to_string(),
-                            comment.lines_of_code_referenced.to_string(),
-                        ])
-                        .expect("Something went wrong when trying to execute an INSERT statement");
-                        println!("inserted into db");
+                                stmt.execute(params![
+                                &comment.raw_contents,
+                                &comment.code_it_refers_to,
+                                &comment.hash_comment(),
+                                &comment.hash_code(),
+                                file_path_str,
+                                comment.location.start.row,
+                                comment.location.start.column,
+                                comment.lines_of_code_referenced,
+                            ])
+                            .expect(
+                                "Something went wrong when trying to execute an INSERT statement",
+                            );
+                            }
+                        }
+                        tx.commit().unwrap();
                     }
+                    return Ok(());
                 }
-                tx.commit().unwrap();
-
-                return Ok(());
             }
         }
-    }
 
-    impl Storage for SqliteDB {
-        fn store(&self, data: &models::CommentData) -> bool {
-            return false;
+        fn store(&self, comment: &models::CommentData) -> Result<(), String> {
+            let conn = Connection::open_with_flags(
+                &self.file,
+                OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | OpenFlags::SQLITE_OPEN_URI
+                    | OpenFlags::SQLITE_OPEN_CREATE
+                    | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )
+            .expect("Something went wrong when opening the db to write");
+            let mut stmt = conn
+                .prepare(
+                    "INSERT INTO Comments
+            (contents, code, contents_hash, code_hash, file_path, row, column, lines_of_code)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                )
+                .expect("something went wrong when preparing hash");
+
+            stmt.execute(params![
+                &comment.raw_contents,
+                &comment.code_it_refers_to,
+                &comment.hash_comment(),
+                &comment.hash_code(),
+                comment.file.to_str().unwrap(),
+                comment.location.start.row,
+                comment.location.start.column,
+                comment.lines_of_code_referenced,
+            ])
+            .expect("Something went wrong when trying to execute an INSERT statement");
+            println!("inserted one record into db");
+            return Ok(());
         }
 
         fn read_all(&self) -> Vec<models::CommentData> {
@@ -269,8 +366,16 @@ CREATE TABLE IF NOT EXISTS Comments(
 
     pub trait Storage {
         //i might need to make this async in the future or just throw it in a different thread
-        fn store(&self, data: &models::CommentData) -> bool {
-            return false;
+        fn store(&self, data: &models::CommentData) -> Result<(), String> {
+            return Ok(());
+        }
+
+        fn store_batch(
+            &self,
+            data: &Vec<models::CommentData>,
+            records_per_transaction: usize,
+        ) -> Result<(), String> {
+            Ok(())
         }
 
         fn read_all(&self) -> Vec<models::CommentData> {
@@ -297,10 +402,9 @@ CREATE TABLE IF NOT EXISTS Comments(
 mod parser {
     use crate::models::{CommentData, SourceLocation};
 
-    use super::{models, storage};
-    use std::collections::HashMap;
+    use super::models;
     use std::io::prelude::*;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
     //we will be ignoring the inline comments probably
     #[derive(PartialEq, Eq, Copy, Clone)]
@@ -315,30 +419,6 @@ mod parser {
         // after the */ multiline comments
         NOT_IN_A_COMMENT,
         NONE,
-    }
-
-    //The parser assumes the options are all valid
-    //we dont need ownership of the options
-    pub struct Parser {
-        options: HashMap<String, String>,
-        state: Option<ParserState>,
-        //if performance gets bad this might be changed to SQLite to avoid the vtable cost
-        storage: Box<dyn storage::Storage>,
-    }
-
-    impl Parser {
-        pub fn new(options: HashMap<String, String>, storage: Box<dyn storage::Storage>) -> Self {
-            Parser {
-                options,
-                storage,
-                state: None,
-            }
-        }
-
-        pub fn debug_dump(&self) {
-            println!("Options are {:?}", &self.options);
-            println!("DB is sqlite");
-        }
     }
 
     fn project_folder() -> String {
@@ -366,83 +446,74 @@ mod parser {
         }
     }
 
-    //this does not belong here
-    fn apply_integrity_rules(
-        parsed_comments: Vec<Vec<(PathBuf, CommentData)>>,
-    ) -> Result<(), String> {
-        return Ok(());
-    }
-
-    pub fn parse_file<T: BufRead>(file: &Path, reader: T) -> Vec<CommentData> {
+    pub fn parse_file<T: BufRead>(file: &Path, reader: T) -> Vec<CommentData<'_>> {
         let mut parser_state = ParserState::empty();
         let mut current_comment_data = CommentData::empty();
         let mut result = Vec::new();
-        current_comment_data.file = file.into();
+        current_comment_data.file = file;
+        let mut current_row = 0;
+        //for this the performance can be improved by going for lower-level parser stuff
+        //i also need the lower-level parser stuff in order to implement editing in file
         for l in reader.lines() {
-            if let Ok(current_line) = l {
-                println!("Current line: {current_line}\n");
-                let current_line = current_line.trim_start();
-                if current_line.starts_with("/*") {
-                    parser_state.set_state(ParserPositionType::IN_MULTILINE_COMMENT);
-                    let comment: String =
-                        current_line.to_string().chars().skip("/*".len()).collect();
-                    current_comment_data.push_comment(&comment);
-                    println!("Entering multiline comment\n");
-                    continue;
-                }
-                if current_line.starts_with("//") {
-                    println!("Entering single line comment\n");
-                    let comment: String =
-                        current_line.to_string().chars().skip("//".len()).collect();
-                    current_comment_data.push_comment(&comment);
-                    parser_state.set_state(ParserPositionType::IN_SINGLE_LINE_COMMENT);
-                    continue;
-                }
-                if current_line.starts_with("*/") {
-                    println!("Exiting multiline comment\n");
-                    parser_state.set_state(ParserPositionType::NONE);
-                    continue;
-                }
-                if parser_state.position == ParserPositionType::IN_MULTILINE_COMMENT {
-                    current_comment_data.push_comment(current_line.trim_start());
-                    continue;
-                }
-
-                if parser_state.position != ParserPositionType::NOT_IN_A_COMMENT {
-                    parser_state.set_state(ParserPositionType::NOT_IN_A_COMMENT);
-                }
-
-                println!("Entering a line of code\n");
-                if parser_state.previous == ParserPositionType::IN_SINGLE_LINE_COMMENT
-                    || parser_state.previous == ParserPositionType::IN_MULTILINE_COMMENT
-                {
-                    let is_stamped = current_comment_data.lines_of_code_referenced > 0;
-                    if !is_stamped {
-                        println!("Pushing an unstamped comment to the result\n");
-                        //an unstamped comment does not need lines of code, just add it to the db
-                        //```comments-2.0 1```
-                        result.push(current_comment_data);
-                        current_comment_data = CommentData::empty();
-                        //this is important as if we dont do this we just keep adding comments
-                        //for every line of code ```comments-2.0 1```
-                        parser_state.set_state(ParserPositionType::NOT_IN_A_COMMENT);
-                        continue;
-                    };
-
-                    let has_lines_of_code_left_to_read = current_comment_data.lines_of_code_read
-                        != current_comment_data.lines_of_code_referenced;
-                    if !has_lines_of_code_left_to_read {
-                        println!("Pushing a stamped comment to the result\n");
-                        result.push(current_comment_data);
-                        current_comment_data = CommentData::empty();
-                    } else {
-                        println!("Pushing code to existing comment");
-                        current_comment_data.lines_of_code_read += 1;
-                        current_comment_data.push_code(current_line.trim_start());
-                    }
-                }
-            } else {
+            current_row += 1;
+            if l.is_err() {
                 break;
+            }
+            let current_line = l.unwrap();
+            let current_line = current_line.trim_start();
+            if current_line.starts_with("/*") {
+                parser_state.set_state(ParserPositionType::IN_MULTILINE_COMMENT);
+                let comment: String = current_line.to_string().chars().skip("/*".len()).collect();
+                current_comment_data.push_comment(&comment);
+                current_comment_data.location.start.row = current_row;
+                continue;
+            }
+            if current_line.starts_with("//") {
+                let comment: String = current_line.to_string().chars().skip("//".len()).collect();
+                current_comment_data.push_comment(&comment);
+                current_comment_data.location.start.row = current_row;
+                parser_state.set_state(ParserPositionType::IN_SINGLE_LINE_COMMENT);
+                continue;
+            }
+            if current_line.starts_with("*/") {
+                parser_state.set_state(ParserPositionType::NONE);
+                continue;
+            }
+            if parser_state.position == ParserPositionType::IN_MULTILINE_COMMENT {
+                current_comment_data.push_comment(current_line.trim_start());
+                continue;
+            }
+
+            if parser_state.position != ParserPositionType::NOT_IN_A_COMMENT {
+                parser_state.set_state(ParserPositionType::NOT_IN_A_COMMENT);
+            }
+
+            if parser_state.previous == ParserPositionType::IN_SINGLE_LINE_COMMENT
+                || parser_state.previous == ParserPositionType::IN_MULTILINE_COMMENT
+            {
+                let is_stamped = current_comment_data.lines_of_code_referenced > 0;
+                if !is_stamped {
+                    //an unstamped comment does not need lines of code, just add it to the db
+                    //```comments-2.0 1```
+                    result.push(current_comment_data);
+                    current_comment_data = CommentData::empty();
+                    current_comment_data.file = file;
+                    //this is important as if we dont do this we just keep adding comments
+                    //for every line of code ```comments-2.0 1```
+                    parser_state.set_state(ParserPositionType::NOT_IN_A_COMMENT);
+                    continue;
+                };
+
+                let has_lines_of_code_left_to_read = current_comment_data.lines_of_code_read
+                    != current_comment_data.lines_of_code_referenced;
+                if !has_lines_of_code_left_to_read {
+                    result.push(current_comment_data);
+                    current_comment_data = CommentData::empty();
+                    current_comment_data.file = file;
+                } else {
+                    current_comment_data.lines_of_code_read += 1;
+                    current_comment_data.push_code(current_line.trim_start());
+                }
             }
         }
         //when it finishes we just pick up any relevant comment ```comments-2.0 3```
@@ -450,29 +521,34 @@ mod parser {
             result.push(current_comment_data);
         }
 
-        println!("Comments found: {}", result.len());
-        return result;
+        //for some reason empty comments are generated in this file and need to be filtered out
+        //```comments-2.0 4```
+        return result
+            .into_iter()
+            .filter(|comment| comment.raw_contents.len() > 0)
+            .collect();
     }
 }
 pub mod models {
-    use std::{hash::Hash, path::PathBuf};
+    use std::{
+        hash::{DefaultHasher, Hash, Hasher},
+        path::Path,
+    };
 
     // i need a different struct for the parser and the db
-    pub struct CommentData {
+    pub struct CommentData<'a> {
         pub location: SourceRange,
         //used in the generation of the hash
         pub raw_contents: String,
         pub code_it_refers_to: String,
-        pub hash_from_comment: String,
 
         //most of the fields should be optional, to signal when they are unstamped
         pub lines_of_code_referenced: u16,
         pub lines_of_code_read: u16,
-        pub file: PathBuf,
-        pub computed_hash: String,
+        pub file: &'a Path,
     }
 
-    impl CommentData {
+    impl<'a> CommentData<'a> {
         pub fn empty() -> Self {
             Self {
                 location: SourceRange {
@@ -480,10 +556,8 @@ pub mod models {
                     end: SourceLocation { row: 0, column: 0 },
                 },
                 raw_contents: "".into(),
-                computed_hash: "".into(),
-                file: PathBuf::default(),
+                file: &Path::new(""),
                 code_it_refers_to: "".into(),
-                hash_from_comment: "".into(),
                 lines_of_code_referenced: 0,
                 lines_of_code_read: 0,
             }
@@ -493,7 +567,6 @@ pub mod models {
             //should ignore the part of the string that
             //has the comments-2.0 stamp
             //and also parse that part to see how many lines of code should be parsed next
-            let final_str = "";
             let open_pattern = "```comments-2.0";
             let close_pattern = "```";
             let stamp_start = string.find(open_pattern);
@@ -545,11 +618,52 @@ pub mod models {
         }
     }
 
-    impl Hash for CommentData {
-        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+    impl<'a> CommentData<'a> {
+        pub fn hash_comment(&self) -> String {
             //using only the code contents and the filename, also the content should first be split into
             //words, also certain characters should be ignored. ```comments-2.0 1```
-            todo!()
+            let mut state = DefaultHasher::new();
+            let normalized: Vec<String> = self
+                .raw_contents
+                .split_whitespace() // split into words
+                .map(|word| {
+                    word.chars()
+                        .filter(|c| c.is_alphanumeric()) // keep only alphanumeric
+                        .collect::<String>()
+                })
+                .filter(|s| !s.is_empty()) // skip empty words
+                .collect();
+
+            for word in normalized {
+                word.hash(&mut state);
+            }
+
+            self.file.hash(&mut state);
+            return state.finish().to_string();
+        }
+
+        //using only the code contents and the filename, also the content should first be split into
+        //words, also certain characters should be ignored. ```comments-2.0 1```
+        pub fn hash_code(&self) -> String {
+            //might need to implement a custom one at some point ```comments-2.0 1```
+            let mut state = DefaultHasher::new();
+            let normalized: Vec<String> = self
+                .raw_contents
+                .split_whitespace() // split into words
+                .map(|word| {
+                    word.chars()
+                        .filter(|c| c.is_alphanumeric()) // keep only alphanumeric
+                        .collect::<String>()
+                })
+                .filter(|s| !s.is_empty()) // skip empty words
+                .collect();
+
+            for word in normalized {
+                word.hash(&mut state);
+            }
+
+            self.file.hash(&mut state);
+            return state.finish().to_string();
         }
     }
 
@@ -563,10 +677,6 @@ pub mod models {
         pub fn empty() -> Self {
             Self { row: 0, column: 0 }
         }
-    }
-
-    pub struct Settings {
-        //all flags i've mentioned in the doc go here
     }
 
     pub struct SourceRange {
@@ -593,6 +703,10 @@ console.log(`hello world`);
             BufReader::new(file_contents.as_bytes()),
         );
 
+        let all_have_file = result
+            .iter()
+            .all(|comments| !comments.file.to_str().unwrap().is_empty());
+        assert!(all_have_file);
         assert_eq!(result.len(), 1);
     }
 
@@ -677,7 +791,8 @@ console.log(`Line 4`)
             let has_code =
                 comment.lines_of_code_referenced > 0 && comment.code_it_refers_to.len() > 0;
             let has_comment = comment.raw_contents.len() > 0;
-            assert!(has_code || has_comment);
+            let has_file_path = comment.file.to_str().unwrap().len() > 0;
+            assert!(has_comment && has_file_path);
         }
     }
 
@@ -685,12 +800,43 @@ console.log(`Line 4`)
     fn ignores_inline_comments() {
         let file_contents = "console.log(`Hello World`); //this prints hello world to the console";
 
-        let temp_file_path = Path::new(&std::env::temp_dir()).join("happy_path_inline_comments.js");
-        let _ = fs::write(&temp_file_path, &file_contents);
-        let result = parse_file(&temp_file_path, BufReader::new(file_contents.as_bytes()));
-        let _ = fs::remove_file(temp_file_path);
+        let result = parse_file(
+            &Path::new("inline_comments.js"),
+            BufReader::new(file_contents.as_bytes()),
+        );
 
         assert!(result.len() == 0);
+    }
+
+    #[test]
+    fn no_empty_comments() {
+        let file_contents = "// single line comment ```comments-2.0 1```
+console.log(`hello world`)
+
+//group of single line comments
+//that should be considered one ```comments-2.0 2```
+console.log(`Line 1`)
+console.log(`Line 2`)
+
+/* a multiline comment
+that has many more lines
+and it doesnt end really
+
+```comments-2.0 2```
+*/
+console.log(`Line 3`)
+console.log(`Line 4`)
+
+//
+";
+
+        let result = parse_file(
+            Path::new("happy.js"),
+            BufReader::new(file_contents.as_bytes()),
+        );
+
+        assert_eq!(result.len(), 3);
+        assert!(result.iter().all(|comment| comment.raw_contents.len() > 0));
     }
 
     #[test]
