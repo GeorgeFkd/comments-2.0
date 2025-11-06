@@ -7,6 +7,31 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 use std::{env, fs};
 
+//General Notes:
+//Saving it to a db might not be ideal, just the parse the project from start everytime
+//There is a file format for how github actions report errors/warnings
+//I dont add warnings/errors for specific rules, leave it up to the user, will provide a sensible
+//default
+//
+//I should also add a --output-format flag to format the result(github action,local file)
+
+struct RuleViolationOnFile<'a> {
+    file: &'a Path,
+    violation: CommentIntegrityRuleViolations,
+}
+
+enum CommentIntegrityRuleViolations {
+    CommentDoesNotReferenceSpecificCode,
+    CodeChangedCommentNot,
+    CommentThatOthersDependOnChanged,
+    CommentThatOthersDependOnDeleted,
+}
+
+//this might become an enum ```comments-2.0 1```
+type AppError = String;
+
+type AppResult<'a> = Result<Vec<RuleViolationOnFile<'a>>, AppError>;
+
 fn main() -> std::process::ExitCode {
     let program_args = env::args();
 
@@ -58,7 +83,7 @@ fn main() -> std::process::ExitCode {
         .flat_map(|p| parser::parse_file(p, BufReader::new(File::open(p).unwrap())))
         .collect();
     let end = Instant::now();
-    //50k files in 13 seconds
+    //50k files in 13 seconds for the llvm project with some dirs excluded
     println!(
         "Completed comments parsing in {:?}",
         end.duration_since(start)
@@ -454,12 +479,14 @@ mod parser {
         let mut current_row = 0;
         //for this the performance can be improved by going for lower-level parser stuff
         //i also need the lower-level parser stuff in order to implement editing in file
+        //or i can just calculate the column by not doing trim_start()
         for l in reader.lines() {
             current_row += 1;
             if l.is_err() {
                 break;
             }
             let current_line = l.unwrap();
+
             let current_line = current_line.trim_start();
             if current_line.starts_with("/*") {
                 parser_state.set_state(ParserPositionType::IN_MULTILINE_COMMENT);
@@ -471,7 +498,9 @@ mod parser {
             if current_line.starts_with("//") {
                 let comment: String = current_line.to_string().chars().skip("//".len()).collect();
                 current_comment_data.push_comment(&comment);
-                current_comment_data.location.start.row = current_row;
+                if current_comment_data.location.start.row == 0 {
+                    current_comment_data.location.start.row = current_row;
+                }
                 parser_state.set_state(ParserPositionType::IN_SINGLE_LINE_COMMENT);
                 continue;
             }
@@ -552,8 +581,8 @@ pub mod models {
         pub fn empty() -> Self {
             Self {
                 location: SourceRange {
-                    start: SourceLocation { row: 0, column: 0 },
-                    end: SourceLocation { row: 0, column: 0 },
+                    start: SourceLocation::empty(),
+                    end: SourceLocation::empty(),
                 },
                 raw_contents: "".into(),
                 file: &Path::new(""),
@@ -563,7 +592,7 @@ pub mod models {
             }
         }
 
-        pub fn push_comment(&mut self, string: &str) {
+        pub fn push_comment(&mut self, string: &str) -> Option<usize> {
             //should ignore the part of the string that
             //has the comments-2.0 stamp
             //and also parse that part to see how many lines of code should be parsed next
@@ -603,11 +632,15 @@ pub mod models {
                         } else {
                             println!("This comment has not been stamped");
                         }
+
+                        return Some(stamp_end - 1);
                     }
+                    return None;
                 }
                 None => {
                     self.raw_contents.push('\n');
                     self.raw_contents.push_str(string);
+                    return None;
                 }
             }
         }
@@ -691,7 +724,6 @@ mod tests {
     use crate::parser::parse_file;
 
     use super::*;
-    use std::{fs, path};
 
     #[test]
     fn happy_path_single_line_comment() {
@@ -841,20 +873,13 @@ console.log(`Line 4`)
 
     #[test]
     fn ignores_comments_in_strings() {
-        //this is very niche just for the bugs it might cause i will implement it
+        //this is very niche just for the bugs and frustration it might cause i will implement it
         todo!();
     }
 
     #[test]
     fn rejects_invalid_arguments() {
         //this can also be a test-doc how's it called in rust
-        todo!();
-    }
-
-    #[test]
-    fn partial_and_full_scan_produce_the_same_result() {
-        //the partial scan will later be implemented, basically a project directory, a Vec<Diffs>,
-        //a Sqlite database
         todo!();
     }
 }
