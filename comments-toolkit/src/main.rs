@@ -6,7 +6,7 @@ use std::iter::Iterator;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use std::{env, fs};
-
+mod source_code_replacer;
 //General Notes:
 //Saving it to a db might not be ideal, just the parse the project from start everytime
 //There is a file format for how github actions report errors/warnings
@@ -14,6 +14,14 @@ use std::{env, fs};
 //default
 //
 //I should also add a --output-format flag to format the result(github action,local file)
+
+//Behaviour: Flag comments that do not reference specific code(no stamp or no lines within the
+//stamp)
+//Flag places where the code changed but the comment did not
+//Flag comments that were changed but others depended on
+//Flag comments that other depended on but were deleted
+
+//Flagging a comment is basically its SourceRange + a Diagnostic message+type(Note/Warning/Error)
 
 struct RuleViolationOnFile<'a> {
     file: &'a Path,
@@ -33,6 +41,7 @@ type AppError = String;
 type AppResult<'a> = Result<Vec<RuleViolationOnFile<'a>>, AppError>;
 
 fn main() -> std::process::ExitCode {
+    source_code_replacer::source_code_replacer::hello_world();
     let program_args = env::args();
 
     let options = parse_program_args(program_args)
@@ -113,6 +122,10 @@ fn main() -> std::process::ExitCode {
     }
 }
 
+fn help_page() -> String {
+    return "This is the help page for now".to_string();
+}
+
 fn get_threads_to_use(files_to_process: u64) -> Option<usize> {
     if files_to_process < 1000 {
         return None;
@@ -183,13 +196,17 @@ fn get_files_from_directory_recursively(
     }
 }
 
-fn parse_program_args(args: Args) -> Result<HashMap<String, String>, &'static str> {
+fn parse_program_args(args: Args) -> Result<HashMap<String, String>, String> {
     //the format is: --<argname1><space><value><space>--<argname2>
     //no need for a library
 
     let mut args: Vec<String> = args.collect();
     if args.len() == 1 {
-        return Err("No arguments passed to executable, can display help page here.");
+        let help_msg = format!(
+            "No arguments passed to executable, the help can be seen here: \n {}",
+            help_page()
+        );
+        return Err(help_msg);
     }
 
     let mut args = args.into_iter();
