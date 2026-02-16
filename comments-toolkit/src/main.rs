@@ -32,6 +32,7 @@ struct RuleViolationOnFile<'a> {
 enum CommentIntegrityRuleViolations<'a> {
     CommentDoesNotReferenceSpecificCode(CommentData<'a>),
     CodeChangedCommentNot(CommentData<'a>),
+    CommentHashNotRegenerated(CommentData<'a>),
     CommentThatOthersDependOnChanged(CommentData<'a>, Vec<CommentData<'a>>),
     CommentThatOthersDependOnDeleted(CommentData<'a>, Vec<CommentData<'a>>),
 }
@@ -127,15 +128,6 @@ fn generate_violations_from_comments(
     comments_of_project: Vec<CommentData<'_>>,
 ) -> Vec<RuleViolationOnFile<'_>> {
     let mut result = vec![];
-    for comment in comments_of_project.into_iter() {
-        if !comment.should_be_ignored && comment.lines_of_code_referenced == 0 {
-            result.push(RuleViolationOnFile {
-                violation: CommentIntegrityRuleViolations::CommentDoesNotReferenceSpecificCode(
-                    comment,
-                ),
-            });
-        }
-    }
     result
 }
 
@@ -599,11 +591,19 @@ pub mod models {
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub enum StampParseError {
-        NO_STAMP_FOUND,
-        STAMP_WITHOUT_CLOSING_TAG,
-        STAMP_WITHOUT_LINES_REFERENCED,
-        STAMP_WITHOUT_HASHES,
-        STAMP_WITHOUT_CODE_HASH,
+        NoStampFound,
+        StampWithoutClosingTag,
+        StampWithoutLinesReferenced,
+        StampWithoutHashes,
+        StampWithoutCodeHash,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum HashCheckResult {
+        BothHashesInvalid,
+        CodeHashNotUpToDate,
+        CommentHashNotUpToDate,
+        BothHashesUpToDate,
     }
 
     // i need a different struct for the parser and the db
@@ -627,6 +627,23 @@ pub mod models {
     }
 
     impl<'a> CommentData<'a> {
+        pub fn check_that_stamp_is_updated(&self) -> HashCheckResult {
+            let code_hash_is_updated = self.hash_code() == self.code_hash_parsed;
+            let comment_hash_is_updated = self.hash_comment() == self.comment_hash_parsed;
+            if code_hash_is_updated && comment_hash_is_updated {
+                return HashCheckResult::BothHashesUpToDate;
+            }
+
+            if code_hash_is_updated && !comment_hash_is_updated {
+                return HashCheckResult::CommentHashNotUpToDate;
+            }
+
+            if !code_hash_is_updated && comment_hash_is_updated {
+                return HashCheckResult::CodeHashNotUpToDate;
+            }
+            return HashCheckResult::BothHashesInvalid;
+        }
+
         pub fn empty() -> Self {
             Self {
                 should_be_ignored: false,
@@ -641,7 +658,7 @@ pub mod models {
                 lines_of_code_read: 0,
                 code_hash_parsed: "".into(),
                 comment_hash_parsed: "".into(),
-                parse_error: Some(StampParseError::NO_STAMP_FOUND),
+                parse_error: Some(StampParseError::NoStampFound),
             }
         }
 
@@ -670,7 +687,7 @@ pub mod models {
                     // println!("Remaining is: {}", remaining);
                     let stamp_end = remaining.find(close_pattern);
                     if stamp_end.is_none() {
-                        self.parse_error = Some(StampParseError::STAMP_WITHOUT_CLOSING_TAG);
+                        self.parse_error = Some(StampParseError::StampWithoutClosingTag);
                         return None;
                     }
                     //parse the slice in between
@@ -680,9 +697,9 @@ pub mod models {
                     // println!("Stamp slice is: {:?}", stamp_slice);
                     let data: Vec<&str> = stamp_slice.split(" ").collect();
                     let parse_error = match data.len() {
-                        0 => Some(StampParseError::STAMP_WITHOUT_LINES_REFERENCED),
-                        1 => Some(StampParseError::STAMP_WITHOUT_HASHES),
-                        2 => Some(StampParseError::STAMP_WITHOUT_CODE_HASH),
+                        0 => Some(StampParseError::StampWithoutLinesReferenced),
+                        1 => Some(StampParseError::StampWithoutHashes),
+                        2 => Some(StampParseError::StampWithoutCodeHash),
                         _ => None,
                     };
                     self.parse_error = parse_error.clone();
@@ -815,7 +832,7 @@ mod tests {
             let _ = cm.push_comment("a comment without a stamp at all");
 
             assert!(cm.parse_error.is_some());
-            assert_eq!(cm.parse_error.unwrap(), StampParseError::NO_STAMP_FOUND);
+            assert_eq!(cm.parse_error.unwrap(), StampParseError::NoStampFound);
         }
 
         #[test]
@@ -826,7 +843,7 @@ mod tests {
             assert!(cm.parse_error.is_some());
             assert_eq!(
                 cm.parse_error.unwrap(),
-                StampParseError::STAMP_WITHOUT_CLOSING_TAG
+                StampParseError::StampWithoutClosingTag
             );
         }
 
@@ -839,15 +856,12 @@ mod tests {
             let _ = cm2.push_comment("hello world ```comments-2.0 1 abc ```");
 
             assert!(cm.parse_error.is_some());
-            assert_eq!(
-                cm.parse_error.unwrap(),
-                StampParseError::STAMP_WITHOUT_HASHES
-            );
+            assert_eq!(cm.parse_error.unwrap(), StampParseError::StampWithoutHashes);
 
             assert!(cm2.parse_error.is_some());
             assert_eq!(
                 cm2.parse_error.unwrap(),
-                StampParseError::STAMP_WITHOUT_CODE_HASH
+                StampParseError::StampWithoutCodeHash
             );
         }
 
