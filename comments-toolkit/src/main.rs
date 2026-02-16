@@ -6,6 +6,8 @@ use std::iter::Iterator;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use std::{env, fs};
+
+use crate::models::CommentData;
 mod source_code_replacer;
 //General Notes:
 //Saving it to a db might not be ideal, just the parse the project from start everytime
@@ -24,15 +26,14 @@ mod source_code_replacer;
 //Flagging a comment is basically its SourceRange + a Diagnostic message+type(Note/Warning/Error)
 
 struct RuleViolationOnFile<'a> {
-    file: &'a Path,
-    violation: CommentIntegrityRuleViolations,
+    violation: CommentIntegrityRuleViolations<'a>,
 }
 
-enum CommentIntegrityRuleViolations {
-    CommentDoesNotReferenceSpecificCode,
-    CodeChangedCommentNot,
-    CommentThatOthersDependOnChanged,
-    CommentThatOthersDependOnDeleted,
+enum CommentIntegrityRuleViolations<'a> {
+    CommentDoesNotReferenceSpecificCode(CommentData<'a>),
+    CodeChangedCommentNot(CommentData<'a>),
+    CommentThatOthersDependOnChanged(CommentData<'a>, Vec<CommentData<'a>>),
+    CommentThatOthersDependOnDeleted(CommentData<'a>, Vec<CommentData<'a>>),
 }
 
 //this might become an enum ```comments-2.0 1```
@@ -120,6 +121,22 @@ fn main() -> std::process::ExitCode {
         );
         return std::process::ExitCode::SUCCESS;
     }
+}
+
+fn generate_violations_from_comments(
+    comments_of_project: Vec<CommentData<'_>>,
+) -> Vec<RuleViolationOnFile<'_>> {
+    let mut result = vec![];
+    for comment in comments_of_project.into_iter() {
+        if !comment.should_be_ignored && comment.lines_of_code_referenced == 0 {
+            result.push(RuleViolationOnFile {
+                violation: CommentIntegrityRuleViolations::CommentDoesNotReferenceSpecificCode(
+                    comment,
+                ),
+            });
+        }
+    }
+    result
 }
 
 fn help_page() -> String {
@@ -580,6 +597,15 @@ pub mod models {
         path::Path,
     };
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum StampParseError {
+        NO_STAMP_FOUND,
+        STAMP_WITHOUT_CLOSING_TAG,
+        STAMP_WITHOUT_LINES_REFERENCED,
+        STAMP_WITHOUT_HASHES,
+        STAMP_WITHOUT_CODE_HASH,
+    }
+
     // i need a different struct for the parser and the db
     #[derive(Debug)]
     pub struct CommentData<'a> {
@@ -594,6 +620,10 @@ pub mod models {
         //bother with it
         pub lines_of_code_read: u16,
         pub file: &'a Path,
+
+        pub code_hash_parsed: String,
+        pub comment_hash_parsed: String,
+        pub parse_error: Option<StampParseError>,
     }
 
     impl<'a> CommentData<'a> {
@@ -609,16 +639,21 @@ pub mod models {
                 code_it_refers_to: "".into(),
                 lines_of_code_referenced: 0,
                 lines_of_code_read: 0,
+                code_hash_parsed: "".into(),
+                comment_hash_parsed: "".into(),
+                parse_error: Some(StampParseError::NO_STAMP_FOUND),
             }
         }
 
         pub fn push_comment(&mut self, string: &str) -> Option<usize> {
+            assert!(!string.contains("//"));
             //should ignore the part of the string that
             //has the comments-2.0 stamp
             //and also parse that part to see how many lines of code should be parsed next
             let open_pattern = "```comments-2.0";
             let close_pattern = "```";
             let stamp_start = string.find(open_pattern);
+            println!("Stamp start: {:?}", stamp_start);
 
             match stamp_start {
                 None => {
@@ -628,46 +663,63 @@ pub mod models {
                 }
 
                 Some(start) => {
-                    let remaining = &string[start + open_pattern.len()..];
-                    let stamp_end = remaining
-                        .find(close_pattern)
-                        .expect("```comments-2.0 ``` stamp is supposed to be all in the same line");
-                    if start == stamp_end {
-                        return None;
-                    }
                     self.raw_contents.push('\n');
                     self.raw_contents.push_str(&string[0..start]);
+
+                    let remaining = &string[start + open_pattern.len()..];
+                    // println!("Remaining is: {}", remaining);
+                    let stamp_end = remaining.find(close_pattern);
+                    if stamp_end.is_none() {
+                        self.parse_error = Some(StampParseError::STAMP_WITHOUT_CLOSING_TAG);
+                        return None;
+                    }
                     //parse the slice in between
                     //in the future it is possible to just use json here and parse it with
                     //serde, not required rn
-                    let stamp_slice = remaining[0..stamp_end].trim();
+                    let stamp_slice = remaining[0..stamp_end.unwrap()].trim();
+                    // println!("Stamp slice is: {:?}", stamp_slice);
                     let data: Vec<&str> = stamp_slice.split(" ").collect();
-                    let lines_referenced = data.get(0);
-                    if let Some(lines_num) = lines_referenced {
-                        println!(
-                            "This comment references the next {} lines of code",
-                            lines_num
-                        );
-                        let parsed_num = lines_num.parse().expect("Could not parse the lines of code number of the ```comments-2.0 ``` stamp");
-                        self.lines_of_code_referenced = parsed_num;
-                        //user wants us to ignore this comment
-                        if parsed_num == 0 {
-                            self.should_be_ignored = true;
-                        }
-                    } else {
-                        self.lines_of_code_referenced = 0;
-                        self.should_be_ignored = false;
-                        println!("This comment needs the lines annotation");
+                    let parse_error = match data.len() {
+                        0 => Some(StampParseError::STAMP_WITHOUT_LINES_REFERENCED),
+                        1 => Some(StampParseError::STAMP_WITHOUT_HASHES),
+                        2 => Some(StampParseError::STAMP_WITHOUT_CODE_HASH),
+                        _ => None,
+                    };
+                    self.parse_error = parse_error.clone();
+                    // println!("Extra data is: {:?}", data);
+                    let lines_referenced = data.get(0).unwrap();
+                    // println!(
+                    //     "This comment references the next {} lines of code",
+                    //     lines_referenced
+                    // );
+                    let parsed_num = lines_referenced.parse().expect(
+                        "Could not parse the lines of code number of the ```comments-2.0 ``` stamp",
+                    );
+                    self.lines_of_code_referenced = parsed_num;
+                    //user wants us to ignore this comment
+                    if parsed_num == 0 {
+                        self.should_be_ignored = true;
                     }
 
-                    let hash_of_lines = data.get(1);
-                    if let Some(hash_str) = hash_of_lines {
-                        println!("This comment is already stamped, the hash is: {}", hash_str);
-                    } else {
-                        println!("This comment has not been stamped");
+                    if parse_error.is_some() {
+                        return None;
                     }
 
-                    return Some(stamp_end - 1);
+                    let hash_of_comment = data.get(1).unwrap();
+                    self.comment_hash_parsed = hash_of_comment.trim().to_string();
+                    println!(
+                        "This comment is already stamped with comment hash, the hash is: {}",
+                        hash_of_comment
+                    );
+
+                    let hash_of_code = data.get(2).unwrap();
+                    self.code_hash_parsed = hash_of_code.trim().to_string();
+                    println!(
+                        "This comment is already stamped with code hash, the hash is: {}",
+                        hash_of_code
+                    );
+
+                    return Some(stamp_end.unwrap() - 1);
                 }
             }
         }
@@ -750,92 +802,183 @@ pub mod models {
 #[cfg(test)]
 mod tests {
 
-    use crate::parser::parse_file;
+    mod comments {
+        use crate::{CommentData, models::StampParseError};
 
-    use super::*;
+        fn empty_comment<'a>() -> CommentData<'a> {
+            CommentData::empty()
+        }
 
-    fn parse_file_helper(file_contents: &str) -> Vec<models::CommentData<'_>> {
-        parse_file(
-            Path::new("a_random_file.js"),
-            BufReader::new(file_contents.as_bytes()),
-        )
+        #[test]
+        fn comment_without_stamp_is_reported() {
+            let mut cm = empty_comment();
+            let _ = cm.push_comment("a comment without a stamp at all");
+
+            assert!(cm.parse_error.is_some());
+            assert_eq!(cm.parse_error.unwrap(), StampParseError::NO_STAMP_FOUND);
+        }
+
+        #[test]
+        fn comment_without_closing_tag_is_reported() {
+            let mut cm = empty_comment();
+            let _ = cm.push_comment("a comment without a closing tag ```comments-2.0 2 abc defg");
+
+            assert!(cm.parse_error.is_some());
+            assert_eq!(
+                cm.parse_error.unwrap(),
+                StampParseError::STAMP_WITHOUT_CLOSING_TAG
+            );
+        }
+
+        #[test]
+        fn comment_without_any_of_the_hashes_is_reported() {
+            let mut cm = empty_comment();
+            let _ = cm.push_comment("hello world ```comments-2.0 1```");
+
+            let mut cm2 = empty_comment();
+            let _ = cm2.push_comment("hello world ```comments-2.0 1 abc ```");
+
+            assert!(cm.parse_error.is_some());
+            assert_eq!(
+                cm.parse_error.unwrap(),
+                StampParseError::STAMP_WITHOUT_HASHES
+            );
+
+            assert!(cm2.parse_error.is_some());
+            assert_eq!(
+                cm2.parse_error.unwrap(),
+                StampParseError::STAMP_WITHOUT_CODE_HASH
+            );
+        }
+
+        #[test]
+        fn comment_with_both_hashes_has_no_parse_error() {
+            let mut cm = empty_comment();
+            let _ = cm.push_comment("hello world ```comments-2.0 1 abc defg  ```");
+
+            assert!(cm.parse_error.is_none());
+        }
+
+        #[test]
+        fn multiline_comment_on_same_line_gets_stamp_correctly() {
+            let mut cm = empty_comment();
+            let _ = cm.push_comment("hello there ```comments-2.0 1 abc defg``` */");
+
+            assert_eq!(cm.comment_hash_parsed, "abc");
+            assert_eq!(cm.code_hash_parsed, "defg");
+        }
+
+        #[test]
+        fn multiline_comment_gets_stamp_correctly() {
+            let mut cm = empty_comment();
+            let _ = cm.push_comment(
+                "
+hello world ```comments-2.0 2 abc defg``` 
+hello there */
+",
+            );
+            assert_eq!(cm.comment_hash_parsed, "abc");
+            assert_eq!(cm.code_hash_parsed, "defg");
+        }
+
+        #[test]
+        fn single_line_comment_gets_stamp_correctly() {
+            let mut cm = empty_comment();
+            let _ = cm.push_comment("hello world ```comments-2.0 1 abc defg ```");
+
+            assert_eq!(cm.comment_hash_parsed, "abc");
+            assert_eq!(cm.code_hash_parsed, "defg");
+        }
     }
 
-    #[test]
-    fn happy_path_single_line_comment() {
-        let file_contents = "//this is a comment ```comments-2.0 1```
+    mod parser {
+
+        use crate::{models, parser::parse_file};
+
+        use std::{io::BufReader, path::Path};
+
+        fn parse_file_helper(file_contents: &str) -> Vec<models::CommentData<'_>> {
+            parse_file(
+                Path::new("a_random_file.js"),
+                BufReader::new(file_contents.as_bytes()),
+            )
+        }
+
+        #[test]
+        fn happy_path_single_line_comment() {
+            let file_contents = "//this is a comment ```comments-2.0 1```
 console.log(`hello world`);
 ";
-        let result = parse_file_helper(file_contents);
+            let result = parse_file_helper(file_contents);
 
-        let all_have_file = result
-            .iter()
-            .all(|comments| !comments.file.to_str().unwrap().is_empty());
-        assert!(all_have_file);
-        assert_eq!(result.len(), 1);
-    }
+            let all_have_file = result
+                .iter()
+                .all(|comments| !comments.file.to_str().unwrap().is_empty());
+            assert!(all_have_file);
+            assert_eq!(result.len(), 1);
+        }
 
-    #[test]
-    fn happy_path_group_of_single_line_comments() {
-        let file_contents = "//this is a group of single line comments
+        #[test]
+        fn happy_path_group_of_single_line_comments() {
+            let file_contents = "//this is a group of single line comments
 //that continues to the next line ```comments-2.0 1```
 console.log(`hello world`);
 ";
 
-        let result = parse_file_helper(file_contents);
+            let result = parse_file_helper(file_contents);
 
-        assert_eq!(result.len(), 1);
-        let comment = result.get(0);
-        assert!(comment.is_some());
-        assert!(
-            comment
-                .unwrap()
-                .raw_contents
-                .contains("that continues to the next line")
-        );
-    }
+            assert_eq!(result.len(), 1);
+            let comment = result.get(0);
+            assert!(comment.is_some());
+            assert!(
+                comment
+                    .unwrap()
+                    .raw_contents
+                    .contains("that continues to the next line")
+            );
+        }
 
-    #[test]
-    fn comment_that_refs_zero_lines_is_ignored() {
-        let file_contents = "//intentionally unstamped ```comments-2.0 0```
+        #[test]
+        fn comment_that_refs_zero_lines_is_ignored() {
+            let file_contents = "//intentionally unstamped ```comments-2.0 0```
 code that should not be captured";
 
-        let result = parse_file_helper(file_contents);
+            let result = parse_file_helper(file_contents);
 
-        assert!(result.len() == 1);
-        assert_eq!(result[0].lines_of_code_referenced, 0);
-        assert!(result[0].should_be_ignored == true);
-        assert!(result[0].code_it_refers_to.is_empty());
-    }
+            assert!(result.len() == 1);
+            assert_eq!(result[0].lines_of_code_referenced, 0);
+            assert!(result[0].should_be_ignored == true);
+            assert!(result[0].code_it_refers_to.is_empty());
+        }
 
-    #[test]
-    fn location_tracking_is_accurate() {
-        let file_contents = "
+        #[test]
+        fn location_tracking_is_accurate() {
+            let file_contents = "
 //comment on line 2 ```comments-2.0 1```
     code with indent on line 3
 ";
 
-        let result = parse_file_helper(file_contents);
-        assert!(result.len() == 1);
-        assert_eq!(result[0].comment_location.start.row, 2);
-        assert_eq!(result[0].comment_location.start.column, 0);
-        assert_eq!(result[0].comment_location.end.row, 2);
-    }
+            let result = parse_file_helper(file_contents);
+            assert!(result.len() == 1);
+            assert_eq!(result[0].comment_location.start.row, 2);
+            assert_eq!(result[0].comment_location.start.column, 0);
+            assert_eq!(result[0].comment_location.end.row, 2);
+        }
 
-    #[test]
-    fn consecutive_multiline_comments_are_grouped() {
-        let file_contents = "/* comment 1 */
+        #[test]
+        fn consecutive_ultiline_comments_are_grouped() {
+            let file_contents = "/* comment 1 */
 /* comment 2 ```comments-2.0 1``` */
 code";
 
-        let result = parse_file_helper(file_contents);
+            let result = parse_file_helper(file_contents);
 
-        assert_eq!(result.len(), 1);
-    }
+            assert_eq!(result.len(), 1);
+        }
 
-    #[test]
-    fn can_detect_multiline_comments() {
-        let file_contents = "/*
+        #[test]
+        fn can_detect_multiline_comments() {
+            let file_contents = "/*
 this is a multiline comment
 that expands to multiple lines
 ```comments-2.0 1``` 
@@ -843,22 +986,22 @@ that expands to multiple lines
 console.log(`hello world`);
 ";
 
-        let result = parse_file_helper(file_contents);
+            let result = parse_file_helper(file_contents);
 
-        assert_eq!(result.len(), 1);
-        let comment = result.get(0);
-        assert!(comment.is_some());
-        assert!(
-            comment
-                .unwrap()
-                .raw_contents
-                .contains("that expands to multiple lines")
-        );
-    }
+            assert_eq!(result.len(), 1);
+            let comment = result.get(0);
+            assert!(comment.is_some());
+            assert!(
+                comment
+                    .unwrap()
+                    .raw_contents
+                    .contains("that expands to multiple lines")
+            );
+        }
 
-    #[test]
-    fn can_handle_all_types_of_comments() {
-        let file_contents = "// single line comment ```comments-2.0 1```
+        #[test]
+        fn can_handle_all_types_of_comments() {
+            let file_contents = "// single line comment ```comments-2.0 1```
 console.log(`hello world`)
 
 //group of single line comments
@@ -876,35 +1019,36 @@ console.log(`Line 3`)
 console.log(`Line 4`)
 ";
 
-        let result = parse_file_helper(file_contents);
+            let result = parse_file_helper(file_contents);
 
-        assert_eq!(result.len(), 3);
+            assert_eq!(result.len(), 3);
 
-        for comment in result {
-            println!("Comment: {}", &comment.code_it_refers_to);
-            let has_code =
-                comment.lines_of_code_referenced > 0 && comment.code_it_refers_to.len() > 0;
-            let has_comment = comment.raw_contents.len() > 0;
-            let has_file_path = comment.file.to_str().unwrap().len() > 0;
-            assert!(has_comment && has_file_path);
+            for comment in result {
+                println!("Comment: {}", &comment.code_it_refers_to);
+                let has_code =
+                    comment.lines_of_code_referenced > 0 && comment.code_it_refers_to.len() > 0;
+                let has_comment = comment.raw_contents.len() > 0;
+                let has_file_path = comment.file.to_str().unwrap().len() > 0;
+                assert!(has_comment && has_file_path);
+            }
         }
-    }
 
-    #[test]
-    fn ignores_inline_comments() {
-        let file_contents = "console.log(`Hello World`); //this prints hello world to the console";
-        let extra_example = "console.log(/* args: */ `Hello World`);";
-        let result = parse_file_helper(file_contents);
+        #[test]
+        fn ignores_inline_comments() {
+            let file_contents =
+                "console.log(`Hello World`); //this prints hello world to the console";
+            let extra_example = "console.log(/* args: */ `Hello World`);";
+            let result = parse_file_helper(file_contents);
 
-        let result_for_comment_inside_code = parse_file_helper(extra_example);
+            let result_for_comment_inside_code = parse_file_helper(extra_example);
 
-        assert!(result_for_comment_inside_code.len() == 0);
-        assert!(result.len() == 0);
-    }
+            assert!(result_for_comment_inside_code.len() == 0);
+            assert!(result.len() == 0);
+        }
 
-    #[test]
-    fn empty_comments_should_be_detected() {
-        let file_contents = "// single line comment ```comments-2.0 1```
+        #[test]
+        fn empty_comments_should_be_detected() {
+            let file_contents = "// single line comment ```comments-2.0 1```
 console.log(`hello world`)
 
 //group of single line comments
@@ -924,11 +1068,11 @@ console.log(`Line 4`)
 //
 ";
 
-        let result = parse_file_helper(file_contents);
-        assert_eq!(result.len(), 4);
-        assert!(result.iter().all(|comment| comment.raw_contents.len() > 0));
+            let result = parse_file_helper(file_contents);
+            assert_eq!(result.len(), 4);
+            assert!(result.iter().all(|comment| comment.raw_contents.len() > 0));
+        }
     }
-
     // #[test]
     // fn rejects_invalid_arguments() {
     //     //this can also be a test-doc how's it called in rust
