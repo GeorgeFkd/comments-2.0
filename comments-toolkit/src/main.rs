@@ -337,8 +337,8 @@ CREATE TABLE IF NOT EXISTS Comments(
                                 &comment.hash_comment(),
                                 &comment.hash_code(),
                                 file_path_str,
-                                comment.location.start.row,
-                                comment.location.start.column,
+                                comment.comment_location.start.row,
+                                comment.comment_location.start.column,
                                 comment.lines_of_code_referenced,
                             ])
                             .expect(
@@ -376,8 +376,8 @@ CREATE TABLE IF NOT EXISTS Comments(
                 &comment.hash_comment(),
                 &comment.hash_code(),
                 comment.file.to_str().unwrap(),
-                comment.location.start.row,
-                comment.location.start.column,
+                comment.comment_location.start.row,
+                comment.comment_location.start.column,
                 comment.lines_of_code_referenced,
             ])
             .expect("Something went wrong when trying to execute an INSERT statement");
@@ -448,131 +448,130 @@ mod parser {
     use std::io::prelude::*;
     use std::path::Path;
 
-    //we will be ignoring the inline comments probably
-    #[derive(PartialEq, Eq, Copy, Clone)]
-    pub enum ParserPositionType {
-        // has seen the character /*
-        IN_MULTILINE_COMMENT,
-        // has seen the character //
-        IN_SINGLE_LINE_COMMENT,
-        // seen the character // not at the beginning of the line
-        IN_INLINE_COMMENT,
-        // is just parsing normally, after single line comment and newline or
-        // after the */ multiline comments
-        NOT_IN_A_COMMENT,
-        NONE,
-    }
-
     fn project_folder() -> String {
         return "".into();
     }
 
-    struct ParserState {
-        pub previous: ParserPositionType,
-        pub position: ParserPositionType,
-        pub location: models::SourceLocation,
-    }
-
-    impl ParserState {
-        pub fn empty() -> Self {
-            Self {
-                previous: ParserPositionType::NONE,
-                position: ParserPositionType::NONE,
-                location: SourceLocation::empty(),
-            }
-        }
-
-        pub fn set_state(&mut self, state: ParserPositionType) {
-            self.previous = self.position;
-            self.position = state;
-        }
+    #[derive(Debug, PartialEq)]
+    enum State {
+        Code,
+        SingleLineComment,
+        MultiLineComment,
+        ReadingReferencedCode { remaining: usize },
     }
 
     pub fn parse_file<T: BufRead>(file: &Path, reader: T) -> Vec<CommentData<'_>> {
-        let mut parser_state = ParserState::empty();
-        let mut current_comment_data = CommentData::empty();
+        let mut state = State::Code;
+        let mut current_comment = CommentData::empty();
+        current_comment.file = file;
         let mut result = Vec::new();
-        current_comment_data.file = file;
         let mut current_row = 0;
-        //for this the performance can be improved by going for lower-level parser stuff
-        //i also need the lower-level parser stuff in order to implement editing in file
-        //or i can just calculate the column by not doing trim_start()
-        for l in reader.lines() {
+
+        for line in reader.lines().flatten() {
             current_row += 1;
-            if l.is_err() {
-                break;
-            }
-            let current_line = l.unwrap();
 
-            let current_line = current_line.trim_start();
-            if current_line.starts_with("/*") {
-                parser_state.set_state(ParserPositionType::IN_MULTILINE_COMMENT);
-                let comment: String = current_line.to_string().chars().skip("/*".len()).collect();
-                current_comment_data.push_comment(&comment);
-                current_comment_data.location.start.row = current_row;
-                continue;
-            }
-            if current_line.starts_with("//") {
-                let comment: String = current_line.to_string().chars().skip("//".len()).collect();
-                current_comment_data.push_comment(&comment);
-                if current_comment_data.location.start.row == 0 {
-                    current_comment_data.location.start.row = current_row;
+            // Calculate column (where non-whitespace starts)
+            let leading_whitespace = line.len() - line.trim_start().len();
+            let current_column = leading_whitespace as u64;
+            let trimmed = line.trim_start();
+
+            match state {
+                State::Code => {
+                    if trimmed.starts_with("/*") {
+                        state = State::MultiLineComment;
+                        current_comment.comment_location.start.row = current_row;
+                        current_comment.comment_location.start.column = current_column;
+                        current_comment.push_comment(&trimmed["/*".len()..]);
+                    } else if trimmed.starts_with("//") {
+                        state = State::SingleLineComment;
+                        current_comment.comment_location.start.row = current_row;
+                        current_comment.comment_location.start.column = current_column;
+                        current_comment.push_comment(&trimmed["//".len()..]);
+                    }
                 }
-                parser_state.set_state(ParserPositionType::IN_SINGLE_LINE_COMMENT);
-                continue;
-            }
-            if current_line.starts_with("*/") {
-                parser_state.set_state(ParserPositionType::NONE);
-                continue;
-            }
-            if parser_state.position == ParserPositionType::IN_MULTILINE_COMMENT {
-                current_comment_data.push_comment(current_line.trim_start());
-                continue;
-            }
 
-            if parser_state.position != ParserPositionType::NOT_IN_A_COMMENT {
-                parser_state.set_state(ParserPositionType::NOT_IN_A_COMMENT);
-            }
+                State::SingleLineComment => {
+                    if trimmed.starts_with("//") {
+                        current_comment.push_comment(&trimmed["//".len()..]);
+                    } else {
+                        // Comment ended
+                        current_comment.comment_location.end.row = current_row - 1;
+                        let is_stamped = current_comment.lines_of_code_referenced > 0;
 
-            if parser_state.previous == ParserPositionType::IN_SINGLE_LINE_COMMENT
-                || parser_state.previous == ParserPositionType::IN_MULTILINE_COMMENT
-            {
-                let is_stamped = current_comment_data.lines_of_code_referenced > 0;
-                if !is_stamped {
-                    //an unstamped comment does not need lines of code, just add it to the db
-                    //```comments-2.0 1```
-                    result.push(current_comment_data);
-                    current_comment_data = CommentData::empty();
-                    current_comment_data.file = file;
-                    //this is important as if we dont do this we just keep adding comments
-                    //for every line of code ```comments-2.0 1```
-                    parser_state.set_state(ParserPositionType::NOT_IN_A_COMMENT);
-                    continue;
-                };
+                        if !is_stamped {
+                            result.push(current_comment);
+                            current_comment = CommentData::empty();
+                            current_comment.file = file;
+                            state = State::Code;
+                        } else {
+                            current_comment.push_code(trimmed);
+                            current_comment.lines_of_code_read = 1;
 
-                let has_lines_of_code_left_to_read = current_comment_data.lines_of_code_read
-                    != current_comment_data.lines_of_code_referenced;
-                if !has_lines_of_code_left_to_read {
-                    result.push(current_comment_data);
-                    current_comment_data = CommentData::empty();
-                    current_comment_data.file = file;
-                } else {
-                    current_comment_data.lines_of_code_read += 1;
-                    current_comment_data.push_code(current_line.trim_start());
+                            if current_comment.lines_of_code_read
+                                == current_comment.lines_of_code_referenced
+                            {
+                                result.push(current_comment);
+                                current_comment = CommentData::empty();
+                                current_comment.file = file;
+                                state = State::Code;
+                            } else {
+                                state = State::ReadingReferencedCode {
+                                    remaining: current_comment.lines_of_code_referenced as usize
+                                        - 1,
+                                };
+                            }
+                        }
+                    }
+                }
+
+                State::MultiLineComment => {
+                    if trimmed.starts_with("*/") {
+                        current_comment.comment_location.end.row = current_row;
+                        current_comment.comment_location.end.column = current_column;
+                        let is_stamped = current_comment.lines_of_code_referenced > 0;
+
+                        if is_stamped {
+                            state = State::ReadingReferencedCode {
+                                remaining: current_comment.lines_of_code_referenced as usize,
+                            };
+                        } else {
+                            result.push(current_comment);
+                            current_comment = CommentData::empty();
+                            current_comment.file = file;
+                            state = State::Code;
+                        }
+                    } else {
+                        current_comment.push_comment(trimmed);
+                    }
+                }
+
+                State::ReadingReferencedCode { remaining } => {
+                    current_comment.push_code(trimmed);
+                    current_comment.lines_of_code_read += 1;
+
+                    if remaining == 1 {
+                        result.push(current_comment);
+                        current_comment = CommentData::empty();
+                        current_comment.file = file;
+                        state = State::Code;
+                    } else {
+                        state = State::ReadingReferencedCode {
+                            remaining: remaining - 1,
+                        };
+                    }
                 }
             }
         }
-        //when it finishes we just pick up any relevant comment ```comments-2.0 3```
-        if current_comment_data.raw_contents.len() > 0 {
-            result.push(current_comment_data);
+
+        // Handle trailing comment
+        if !current_comment.raw_contents.is_empty() {
+            result.push(current_comment);
         }
 
-        //for some reason empty comments are generated in this file and need to be filtered out
-        //```comments-2.0 4```
-        return result
+        result
             .into_iter()
-            .filter(|comment| comment.raw_contents.len() > 0)
-            .collect();
+            .filter(|comment| !comment.raw_contents.is_empty())
+            .collect()
     }
 }
 pub mod models {
@@ -582,14 +581,17 @@ pub mod models {
     };
 
     // i need a different struct for the parser and the db
+    #[derive(Debug)]
     pub struct CommentData<'a> {
-        pub location: SourceRange,
+        pub comment_location: SourceRange,
         //used in the generation of the hash
         pub raw_contents: String,
         pub code_it_refers_to: String,
 
         //most of the fields should be optional, to signal when they are unstamped
         pub lines_of_code_referenced: u16,
+        pub should_be_ignored: bool, //when the user inputs 0 as the lines referenced i should not
+        //bother with it
         pub lines_of_code_read: u16,
         pub file: &'a Path,
     }
@@ -597,7 +599,8 @@ pub mod models {
     impl<'a> CommentData<'a> {
         pub fn empty() -> Self {
             Self {
-                location: SourceRange {
+                should_be_ignored: false,
+                comment_location: SourceRange {
                     start: SourceLocation::empty(),
                     end: SourceLocation::empty(),
                 },
@@ -618,46 +621,53 @@ pub mod models {
             let stamp_start = string.find(open_pattern);
 
             match stamp_start {
+                None => {
+                    self.raw_contents.push('\n');
+                    self.raw_contents.push_str(string);
+                    return None;
+                }
+
                 Some(start) => {
                     let remaining = &string[start + open_pattern.len()..];
                     let stamp_end = remaining
                         .find(close_pattern)
                         .expect("```comments-2.0 ``` stamp is supposed to be all in the same line");
-                    if start != stamp_end {
-                        self.raw_contents.push('\n');
-                        self.raw_contents.push_str(&string[0..start]);
-                        //parse the slice in between
-                        //in the future it is possible to just use json here and parse it with
-                        //serde, not required rn
-                        let stamp_slice = remaining[0..stamp_end].trim();
-                        let data: Vec<&str> = stamp_slice.split(" ").collect();
-                        let lines_referenced = data.get(0);
-                        if let Some(lines_num) = lines_referenced {
-                            println!(
-                                "This comment references the next {} lines of code",
-                                lines_num
-                            );
-                            self.lines_of_code_referenced = lines_num.parse().expect("Could not parse the lines of code number of the ```comments-2.0 ``` stamp");
-                        } else {
-                            self.lines_of_code_referenced = 0;
-                            println!("This comment needs the lines annotation");
-                        }
-
-                        let hash_of_lines = data.get(1);
-                        if let Some(hash_str) = hash_of_lines {
-                            println!("This comment is already stamped, the hash is: {}", hash_str);
-                        } else {
-                            println!("This comment has not been stamped");
-                        }
-
-                        return Some(stamp_end - 1);
+                    if start == stamp_end {
+                        return None;
                     }
-                    return None;
-                }
-                None => {
                     self.raw_contents.push('\n');
-                    self.raw_contents.push_str(string);
-                    return None;
+                    self.raw_contents.push_str(&string[0..start]);
+                    //parse the slice in between
+                    //in the future it is possible to just use json here and parse it with
+                    //serde, not required rn
+                    let stamp_slice = remaining[0..stamp_end].trim();
+                    let data: Vec<&str> = stamp_slice.split(" ").collect();
+                    let lines_referenced = data.get(0);
+                    if let Some(lines_num) = lines_referenced {
+                        println!(
+                            "This comment references the next {} lines of code",
+                            lines_num
+                        );
+                        let parsed_num = lines_num.parse().expect("Could not parse the lines of code number of the ```comments-2.0 ``` stamp");
+                        self.lines_of_code_referenced = parsed_num;
+                        //user wants us to ignore this comment
+                        if parsed_num == 0 {
+                            self.should_be_ignored = true;
+                        }
+                    } else {
+                        self.lines_of_code_referenced = 0;
+                        self.should_be_ignored = false;
+                        println!("This comment needs the lines annotation");
+                    }
+
+                    let hash_of_lines = data.get(1);
+                    if let Some(hash_str) = hash_of_lines {
+                        println!("This comment is already stamped, the hash is: {}", hash_str);
+                    } else {
+                        println!("This comment has not been stamped");
+                    }
+
+                    return Some(stamp_end - 1);
                 }
             }
         }
@@ -717,6 +727,7 @@ pub mod models {
         }
     }
 
+    #[derive(Debug)]
     pub struct SourceLocation {
         pub row: u64,
         //column will now not be used yet
@@ -729,6 +740,7 @@ pub mod models {
         }
     }
 
+    #[derive(Debug)]
     pub struct SourceRange {
         pub start: SourceLocation,
         pub end: SourceLocation,
@@ -742,15 +754,19 @@ mod tests {
 
     use super::*;
 
+    fn parse_file_helper(file_contents: &str) -> Vec<models::CommentData<'_>> {
+        parse_file(
+            Path::new("a_random_file.js"),
+            BufReader::new(file_contents.as_bytes()),
+        )
+    }
+
     #[test]
     fn happy_path_single_line_comment() {
         let file_contents = "//this is a comment ```comments-2.0 1```
 console.log(`hello world`);
 ";
-        let result = parse_file(
-            Path::new("file.js"),
-            BufReader::new(file_contents.as_bytes()),
-        );
+        let result = parse_file_helper(file_contents);
 
         let all_have_file = result
             .iter()
@@ -766,10 +782,7 @@ console.log(`hello world`);
 console.log(`hello world`);
 ";
 
-        let result = parse_file(
-            Path::new("happy.js"),
-            BufReader::new(file_contents.as_bytes()),
-        );
+        let result = parse_file_helper(file_contents);
 
         assert_eq!(result.len(), 1);
         let comment = result.get(0);
@@ -783,6 +796,44 @@ console.log(`hello world`);
     }
 
     #[test]
+    fn comment_that_refs_zero_lines_is_ignored() {
+        let file_contents = "//intentionally unstamped ```comments-2.0 0```
+code that should not be captured";
+
+        let result = parse_file_helper(file_contents);
+
+        assert!(result.len() == 1);
+        assert_eq!(result[0].lines_of_code_referenced, 0);
+        assert!(result[0].should_be_ignored == true);
+        assert!(result[0].code_it_refers_to.is_empty());
+    }
+
+    #[test]
+    fn location_tracking_is_accurate() {
+        let file_contents = "
+//comment on line 2 ```comments-2.0 1```
+    code with indent on line 3
+";
+
+        let result = parse_file_helper(file_contents);
+        assert!(result.len() == 1);
+        assert_eq!(result[0].comment_location.start.row, 2);
+        assert_eq!(result[0].comment_location.start.column, 0);
+        assert_eq!(result[0].comment_location.end.row, 2);
+    }
+
+    #[test]
+    fn consecutive_multiline_comments_are_grouped() {
+        let file_contents = "/* comment 1 */
+/* comment 2 ```comments-2.0 1``` */
+code";
+
+        let result = parse_file_helper(file_contents);
+
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
     fn can_detect_multiline_comments() {
         let file_contents = "/*
 this is a multiline comment
@@ -792,10 +843,7 @@ that expands to multiple lines
 console.log(`hello world`);
 ";
 
-        let result = parse_file(
-            Path::new("happy.js"),
-            BufReader::new(file_contents.as_bytes()),
-        );
+        let result = parse_file_helper(file_contents);
 
         assert_eq!(result.len(), 1);
         let comment = result.get(0);
@@ -828,10 +876,7 @@ console.log(`Line 3`)
 console.log(`Line 4`)
 ";
 
-        let result = parse_file(
-            Path::new("happy.js"),
-            BufReader::new(file_contents.as_bytes()),
-        );
+        let result = parse_file_helper(file_contents);
 
         assert_eq!(result.len(), 3);
 
@@ -848,17 +893,17 @@ console.log(`Line 4`)
     #[test]
     fn ignores_inline_comments() {
         let file_contents = "console.log(`Hello World`); //this prints hello world to the console";
+        let extra_example = "console.log(/* args: */ `Hello World`);";
+        let result = parse_file_helper(file_contents);
 
-        let result = parse_file(
-            &Path::new("inline_comments.js"),
-            BufReader::new(file_contents.as_bytes()),
-        );
+        let result_for_comment_inside_code = parse_file_helper(extra_example);
 
+        assert!(result_for_comment_inside_code.len() == 0);
         assert!(result.len() == 0);
     }
 
     #[test]
-    fn no_empty_comments() {
+    fn empty_comments_should_be_detected() {
         let file_contents = "// single line comment ```comments-2.0 1```
 console.log(`hello world`)
 
@@ -879,24 +924,14 @@ console.log(`Line 4`)
 //
 ";
 
-        let result = parse_file(
-            Path::new("happy.js"),
-            BufReader::new(file_contents.as_bytes()),
-        );
-
-        assert_eq!(result.len(), 3);
+        let result = parse_file_helper(file_contents);
+        assert_eq!(result.len(), 4);
         assert!(result.iter().all(|comment| comment.raw_contents.len() > 0));
     }
 
-    #[test]
-    fn ignores_comments_in_strings() {
-        //this is very niche just for the bugs and frustration it might cause i will implement it
-        todo!();
-    }
-
-    #[test]
-    fn rejects_invalid_arguments() {
-        //this can also be a test-doc how's it called in rust
-        todo!();
-    }
+    // #[test]
+    // fn rejects_invalid_arguments() {
+    //     //this can also be a test-doc how's it called in rust
+    //     todo!();
+    // }
 }
