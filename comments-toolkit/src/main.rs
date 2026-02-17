@@ -7,131 +7,125 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 use std::{env, fs};
 
-use crate::models::{CommentData, HashCheckResult, StampParseError};
+use crate::models::{CommentData, StampParseError};
 mod source_code_replacer;
 //General Notes:
 //Saving it to a db might not be ideal, just the parse the project from start everytime
 //There is a file format for how github actions report errors/warnings
 //I dont add warnings/errors for specific rules, leave it up to the user, will provide a sensible
 //default
-//
-//I should also add a --output-format flag to format the result(github action,local file)
 
-//Behaviour: Flag comments that do not reference specific code(no stamp or no lines within the
-//stamp)
-//Flag places where the code changed but the comment did not
-//Flag comments that were changed but others depended on
-//Flag comments that other depended on but were deleted
-
-//Flagging a comment is basically its SourceRange + a Diagnostic message+type(Note/Warning/Error)
-
-struct RuleViolationOnFile<'a> {
+pub struct RuleViolationOnFile<'a> {
     violation: CommentIntegrityRuleViolations<'a>,
 }
+#[derive(PartialEq, Eq)]
+pub enum ViolationLevel {
+    Warning,
+    Error,
+    Note,
+}
 
-impl<'a> RuleViolationOnFile<'a> {
-    pub fn display_to_user(&self) -> String {
-        match &self.violation {
-            CommentIntegrityRuleViolations::CommentDoesNotReferenceSpecificCode(comment) => {
-                format!(
-                    "{}:{}:{}: Warning: Comment does not reference specific code (no stamp found)\n  Comment: {}",
-                    comment.file.display(),
-                    comment.comment_location.start.row,
-                    comment.comment_location.start.column,
-                    comment.raw_contents.lines().next().unwrap_or("").trim()
-                )
-            }
-
-            CommentIntegrityRuleViolations::ParseErrorThatShouldBeFixed(comment) => {
-                let error_msg = match &comment.parse_error {
-                    Some(StampParseError::StampWithoutClosingTag) => "stamp missing closing ```",
-                    Some(StampParseError::StampWithoutLinesReferenced) => {
-                        "stamp missing line count"
-                    }
-                    Some(StampParseError::StampWithoutCodeHash) => "stamp missing code hash",
-                    _ => "malformed stamp",
-                };
-                format!(
-                    "{}:{}:{}: Error: Parse error - {}\n  Comment: {}",
-                    comment.file.display(),
-                    comment.comment_location.start.row,
-                    comment.comment_location.start.column,
-                    error_msg,
-                    comment.raw_contents.lines().next().unwrap_or("").trim()
-                )
-            }
-
-            CommentIntegrityRuleViolations::CodeChangedCommentNot(comment) => {
-                format!(
-                    "{}:{}:{}: Warning: Code changed but comment hash is still valid\n  Expected code hash: {}\n  Actual code hash: {}\n  Comment: {}",
-                    comment.file.display(),
-                    comment.comment_location.start.row,
-                    comment.comment_location.start.column,
-                    comment.code_hash_parsed,
-                    comment.hash_code(),
-                    comment.raw_contents.lines().next().unwrap_or("").trim()
-                )
-            }
-
-            CommentIntegrityRuleViolations::CommentHashNotRegenerated(comment) => {
-                format!(
-                    "{}:{}:{}: Warning: Comment hash needs regeneration\n  Expected comment hash: {}\n  Actual comment hash: {}\n  Comment: {}",
-                    comment.file.display(),
-                    comment.comment_location.start.row,
-                    comment.comment_location.start.column,
-                    comment.comment_hash_parsed,
-                    comment.hash_comment(),
-                    comment.raw_contents.lines().next().unwrap_or("").trim()
-                )
-            }
-
-            _ => "".to_string(), // CommentIntegrityRuleViolations::CommentThatOthersDependOnChanged(
-                                 //     comment,
-                                 //     dependents,
-                                 // ) => {
-                                 //     let mut result = format!(
-                                 //         "{}:{}:{}: Warning: Comment changed but {} other comment(s) depend on it\n  Comment: {}\n  Dependents:",
-                                 //         comment.file.display(),
-                                 //         comment.comment_location.start.row,
-                                 //         comment.comment_location.start.column,
-                                 //         dependents.len(),
-                                 //         comment.raw_contents.lines().next().unwrap_or("").trim()
-                                 //     );
-                                 //     for dep in dependents {
-                                 //         result.push_str(&format!(
-                                 //             "\n    - {}:{}:{}",
-                                 //             dep.file.display(),
-                                 //             dep.comment_location.start.row,
-                                 //             dep.comment_location.start.column
-                                 //         ));
-                                 //     }
-                                 //     result
-                                 // }
-
-                                 // CommentIntegrityRuleViolations::CommentThatOthersDependOnDeleted(comment) => {
-                                 //     let mut result = format!(
-                                 //         "{}:{}:{}: Error: Comment deleted but {} other comment(s) depend on it\n  Comment: {}\n  Dependents:",
-                                 //         comment.file.display(),
-                                 //         comment.comment_location.start.row,
-                                 //         comment.comment_location.start.column,
-                                 //         dependents.len(),
-                                 //         comment.raw_contents.lines().next().unwrap_or("").trim()
-                                 //     );
-                                 //     for dep in dependents {
-                                 //         result.push_str(&format!(
-                                 //             "\n    - {}:{}:{}",
-                                 //             dep.file.display(),
-                                 //             dep.comment_location.start.row,
-                                 //             dep.comment_location.start.column
-                                 //         ));
-                                 //     }
-                                 //     result
-                                 // }
+impl ViolationLevel {
+    pub fn as_str(&self) -> &str {
+        match self {
+            ViolationLevel::Warning => "warning",
+            ViolationLevel::Error => "error",
+            ViolationLevel::Note => "notice",
         }
     }
 }
 
-pub fn display_violations_to_user(violations: &[RuleViolationOnFile]) -> String {
+fn violation_to_message<'a>(
+    violation: &'a CommentIntegrityRuleViolations,
+) -> (&'a CommentData<'a>, ViolationLevel, String) {
+    match violation {
+        CommentIntegrityRuleViolations::CommentDoesNotReferenceSpecificCode(comment) => (
+            comment,
+            ViolationLevel::Warning,
+            "Comment does not reference specific code (no stamp found)".to_string(),
+        ),
+        CommentIntegrityRuleViolations::ParseErrorThatShouldBeFixed(comment) => (
+            comment,
+            ViolationLevel::Error,
+            match &comment.parse_error {
+                Some(StampParseError::StampWithoutClosingTag) => {
+                    "stamp missing closing ```".to_string()
+                }
+                Some(StampParseError::StampWithoutLinesReferenced) => {
+                    "stamp missing line count".to_string()
+                }
+                Some(StampParseError::StampWithoutCodeHash) => {
+                    "stamp missing code hash".to_string()
+                }
+                _ => "malformed stamp".to_string(),
+            },
+        ),
+        CommentIntegrityRuleViolations::CodeChangedCommentNot(comment) => (
+            comment,
+            ViolationLevel::Error,
+            format!(
+                "Code hash changed but comment was not updated (expected: {}, actual: {})",
+                comment.code_hash_parsed,
+                comment.hash_code()
+            ),
+        ),
+        CommentIntegrityRuleViolations::CommentHashNotRegenerated(comment) => (
+            comment,
+            ViolationLevel::Warning,
+            format!(
+                "Comment hash needs regeneration (expected: {}, actual: {})",
+                comment.comment_hash_parsed,
+                comment.hash_comment()
+            ),
+        ),
+        CommentIntegrityRuleViolations::CommentThatOthersDependOnChanged(comment) => (
+            comment,
+            ViolationLevel::Error,
+            "Comment changed but other comments depend on it".to_string(),
+        ),
+        CommentIntegrityRuleViolations::CommentThatOthersDependOnDeleted(comment) => (
+            comment,
+            ViolationLevel::Error,
+            "Comment deleted but other comments depend on it".to_string(),
+        ),
+    }
+}
+
+impl<'a> RuleViolationOnFile<'a> {
+    pub fn display_to_user(&self, output_format: &str) -> (String, String) {
+        let (comment, level, message) = violation_to_message(&self.violation);
+        (
+            format_violation(output_format, level.as_str(), comment, &message),
+            level.as_str().to_owned(),
+        )
+    }
+}
+
+fn format_violation(output_format: &str, level: &str, comment: &CommentData, msg: &str) -> String {
+    match output_format {
+        "github" => format!(
+            "::{} file={},line={},col={}::{}",
+            level,
+            comment.file.display(),
+            comment.comment_location.start.row,
+            comment.comment_location.start.column,
+            msg
+        ),
+        _ => format!(
+            "{}:{}:{}: {}: {}",
+            comment.file.display(),
+            comment.comment_location.start.row,
+            comment.comment_location.start.column,
+            level,
+            msg
+        ),
+    }
+}
+
+pub fn display_violations_to_user(
+    violations: &[RuleViolationOnFile],
+    output_format: &str,
+) -> String {
     if violations.is_empty() {
         return "No violations found! All comments are up to date.".to_string();
     }
@@ -139,7 +133,7 @@ pub fn display_violations_to_user(violations: &[RuleViolationOnFile]) -> String 
     let mut result = format!("Found {} violation(s):\n\n", violations.len());
 
     for (idx, violation) in violations.iter().enumerate() {
-        result.push_str(&violation.display_to_user());
+        result.push_str(&violation.display_to_user(output_format).0);
         if idx < violations.len() - 1 {
             result.push_str("\n\n");
         }
@@ -148,7 +142,7 @@ pub fn display_violations_to_user(violations: &[RuleViolationOnFile]) -> String 
     result
 }
 
-enum CommentIntegrityRuleViolations<'a> {
+pub enum CommentIntegrityRuleViolations<'a> {
     CommentDoesNotReferenceSpecificCode(&'a CommentData<'a>),
     ParseErrorThatShouldBeFixed(&'a CommentData<'a>),
     CodeChangedCommentNot(&'a CommentData<'a>),
@@ -179,7 +173,7 @@ fn position_from_row_col(content: &str, row: u64, col: u64) -> Option<usize> {
     None // Row not found
 }
 
-//this might become an enum ```comments-2.0 1 1489893222977162209 1489893222977162209```
+//this might become an enum ```comments-2.0 1 1489893222977162209 148989362209```
 type AppError = String;
 
 type AppResult<'a> = Result<Vec<RuleViolationOnFile<'a>>, AppError>;
@@ -240,13 +234,33 @@ fn main() -> std::process::ExitCode {
     let end = Instant::now();
     //50k files in 13 seconds for the llvm project with some dirs excluded
     println!(
-        "Completed comments parsing in {:?}",
+        "Completed comments parsing {} files in {:?}",
+        project_files.len(),
         end.duration_since(start)
     );
 
     let violations = generate_violations_from_comments(&comment_data_of_files);
 
-    println!("{}", display_violations_to_user(violations.as_slice()));
+    let output_format = options
+        .get("output-format")
+        .map(String::as_str)
+        .unwrap_or("github");
+    println!("Output format selected is: {:?}", output_format);
+
+    println!(
+        "=====Violations =======\n {} ",
+        display_violations_to_user(violations.as_slice(), output_format)
+    );
+    if !violations.is_empty() {
+        return std::process::ExitCode::FAILURE;
+    }
+    if violations
+        .iter()
+        .map(|rv| violation_to_message(&rv.violation))
+        .any(|v| v.1 == ViolationLevel::Error)
+    {
+        return std::process::ExitCode::FAILURE;
+    }
 
     let should_regenerate_non_hashed_comments = options.get("regenerate");
     if should_regenerate_non_hashed_comments.is_some() {
@@ -279,87 +293,35 @@ fn main() -> std::process::ExitCode {
                     }
                 }
             }
-            // Apply changes if any
-            if !content_changes.is_empty() {
-                println!(
-                    "Adding {} hash(es) to {}",
-                    content_changes.len(),
-                    file_path.display()
-                );
-                let file_contents = fs::read_to_string(file_path)
-                    .map_err(|e| format!("Failed to read file {}: {}", file_path.display(), e))
-                    .unwrap();
-                let reader = BufReader::new(file_contents.as_bytes());
-
-                // Convert String to &str
-                let content_changes_refs: Vec<(usize, usize, &str)> = content_changes
-                    .iter()
-                    .map(|(row, col, s)| (*row, *col, s.as_str()))
-                    .collect();
-
-                let modified_content = source_code_replacer::with_multiple_added_content_at(
-                    reader,
-                    content_changes_refs,
-                )
-                .map_err(|e| format!("Failed to modify {}: {}", file_path.display(), e))
-                .unwrap();
-                fs::write(file_path, modified_content)
-                    .map_err(|e| format!("Failed to write file {}: {}", file_path.display(), e))
-                    .unwrap();
+            if content_changes.is_empty() {
+                println!("No changes to be made in file {:?}\n", file_path);
+                continue;
             }
-        }
 
-        // // Process each file
-        // for (file_path, file_comments) in comments_by_file {
-        //     let mut content_changes = Vec::new();
-        //
-        //     for comment in file_comments {
-        //         // Skip comments that should be ignored
-        //         if comment.should_be_ignored {
-        //             continue;
-        //         }
-        //
-        //         if let Some(ref parse_err) = comment.parse_error {
-        //             if *parse_err == StampParseError::StampWithoutHashes {
-        //                 if let Some(ref stamp_end) = comment.stamp_end {
-        //                     // let comment_hash =
-        //                     // let code_hash = ;
-        //                     // hashes_strings.push(hashes_to_insert.clone());
-        //
-        //                     // let idx = hashes_strings.len() - 1;
-        //                     content_changes.push((
-        //                         stamp_end.row - 1, // Convert to 0-indexed
-        //                         stamp_end.column,
-        //                         format!(" {} {}", comment.hash_comment(), comment.hash_code()),
-        //                     ));
-        //                 }
-        //             }
-        //         }
-        //     }
-        //
-        //     // Apply changes if any
-        //     if !content_changes.is_empty() {
-        //         println!(
-        //             "Adding {} hash(es) to {}",
-        //             content_changes.len(),
-        //             file_path.display()
-        //         );
-        //
-        //         let file_contents = fs::read_to_string(file_path)
-        //             .map_err(|e| format!("Failed to read file {}: {}", file_path.display(), e))
-        //             .unwrap();
-        //
-        //         let reader = BufReader::new(file_contents.as_bytes());
-        //         let modified_content =
-        //             source_code_replacer::with_multiple_added_content_at(reader, content_changes)
-        //                 .map_err(|e| format!("Failed to modify {}: {}", file_path.display(), e))
-        //                 .unwrap();
-        //
-        //         fs::write(file_path, modified_content)
-        //             .map_err(|e| format!("Failed to write file {}: {}", file_path.display(), e))
-        //             .unwrap();
-        //     }
-        // }
+            println!(
+                "Adding {} hash(es) to {}",
+                content_changes.len(),
+                file_path.display()
+            );
+
+            let reader = BufReader::new(
+                File::open(file_path).expect(&format!("File could not be opened {:?}", file_path)),
+            );
+
+            //This is a bit awkward should sometime be fixed ```comments-2.0 4 132957344 13295432557734468097```
+            let content_changes_refs: Vec<(usize, usize, &str)> = content_changes
+                .iter()
+                .map(|(row, col, s)| (*row, *col, s.as_str()))
+                .collect();
+
+            let modified_content =
+                source_code_replacer::with_multiple_added_content_at(reader, content_changes_refs)
+                    .map_err(|e| format!("Failed to modify {}: {}", file_path.display(), e))
+                    .unwrap();
+            fs::write(file_path, modified_content)
+                .map_err(|e| format!("Failed to write file {}: {}", file_path.display(), e))
+                .unwrap();
+        }
 
         println!("Hash generation complete.");
     } else {
@@ -396,53 +358,7 @@ fn generate_violations_from_comments<'a>(
 ) -> Vec<RuleViolationOnFile<'a>> {
     comments_of_project
         .iter()
-        .filter_map(|comment| {
-            // Skip comments that should be ignored
-            if comment.should_be_ignored {
-                return None;
-            }
-
-            // Check for parse errors first
-            if let Some(ref parse_err) = comment.parse_error {
-                match parse_err {
-                    StampParseError::NoStampFound => {
-                        return Some(RuleViolationOnFile {
-                            violation:
-                                CommentIntegrityRuleViolations::CommentDoesNotReferenceSpecificCode(
-                                    comment,
-                                ),
-                        });
-                    }
-                    StampParseError::StampWithoutClosingTag
-                    | StampParseError::StampWithoutLinesReferenced
-                    | StampParseError::StampWithoutCodeHash => {
-                        return Some(RuleViolationOnFile {
-                            violation: CommentIntegrityRuleViolations::ParseErrorThatShouldBeFixed(
-                                comment,
-                            ),
-                        });
-                    }
-                    StampParseError::StampWithoutHashes => {
-                        // This is handled separately below in hash check
-                    }
-                }
-            }
-
-            match comment.check_that_stamp_is_updated() {
-                HashCheckResult::HashesShouldBeGenerated => Some(RuleViolationOnFile {
-                    violation: CommentIntegrityRuleViolations::CommentHashNotRegenerated(comment),
-                }),
-                HashCheckResult::CodeHashNotUpToDate | HashCheckResult::BothHashesInvalid => {
-                    Some(RuleViolationOnFile {
-                        violation: CommentIntegrityRuleViolations::CodeChangedCommentNot(comment),
-                    })
-                }
-                HashCheckResult::CommentHashNotUpToDate => Some(RuleViolationOnFile {
-                    violation: CommentIntegrityRuleViolations::CommentHashNotRegenerated(comment),
-                }),
-                HashCheckResult::BothHashesUpToDate => None,
-            }
-        })
+        .filter_map(CommentData::get_violation)
         .collect()
 }
 
@@ -456,11 +372,11 @@ DESCRIPTION:
     Comments can be 'stamped' with ```comments-2.0 N COMMENT_HASH CODE_HASH``` to 
     indicate they reference the next N lines of code and include integrity hashes.
     
-    The tool stores comment data in SQLite and can detect:
+    The tool stores can detect:
     - Comments without stamps (unstamped comments)
     - Code that changed but comment didn't (stale comments)
-    - Comments that changed but code didn't (outdated documentation)
-    - Missing or incomplete hash stamps
+    - Comments that changed but code didn't 
+    - Dependencies between comments, and generate warnings when a dependency is deleted or changed
 
 REQUIRED FLAGS:
     --source <PATH>
@@ -477,7 +393,10 @@ REQUIRED FLAGS:
 OPTIONAL FLAGS:
     --db <PATH>
         Path to SQLite database file (default: comments.sqlite)
-
+    --regenerate
+        Flag to generate hashes for comments that have not be hashed yet
+    --output-format <github>
+        How to print out the violations
 COMMENT STAMP FORMAT:
     Single-line comments:
         // Your comment text ```comments-2.0 0 comment_hash code_hash```
@@ -526,25 +445,6 @@ EXAMPLES:
     // General note about the file architecture
     // ```comments-2.0 0```
 
-DATABASE SCHEMA:
-    Comments table stores:
-    - Comment content and referenced code
-    - Hash values for integrity checking
-    - File path and location (row, column)
-    - Number of lines referenced
-    - Timestamp of when recorded
-
-OUTPUT:
-    The tool outputs:
-    - Number of files processed
-    - Number of comments found
-    - Parse time and database storage time
-    - Violations detected (if any)
-
-PERFORMANCE:
-    - Processes ~50,000 files in ~13 seconds (LLVM project)
-    - Uses multiple threads for large projects (>1000 files)
-    - Batch database inserts for efficiency (500 records/transaction)
 ".to_string()
 }
 
@@ -1036,6 +936,8 @@ pub mod models {
         path::Path,
     };
 
+    use crate::{CommentIntegrityRuleViolations, RuleViolationOnFile};
+
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub enum StampParseError {
         NoStampFound,
@@ -1076,6 +978,53 @@ pub mod models {
     }
 
     impl<'a> CommentData<'a> {
+        pub fn get_violation(&self) -> Option<RuleViolationOnFile<'_>> {
+            if self.should_be_ignored {
+                return None;
+            }
+
+            // Check for parse errors first
+            if let Some(ref parse_err) = self.parse_error {
+                match parse_err {
+                    StampParseError::NoStampFound => {
+                        return Some(RuleViolationOnFile {
+                            violation:
+                                CommentIntegrityRuleViolations::CommentDoesNotReferenceSpecificCode(
+                                    &self,
+                                ),
+                        });
+                    }
+                    StampParseError::StampWithoutClosingTag
+                    | StampParseError::StampWithoutLinesReferenced
+                    | StampParseError::StampWithoutCodeHash => {
+                        return Some(RuleViolationOnFile {
+                            violation: CommentIntegrityRuleViolations::ParseErrorThatShouldBeFixed(
+                                &self,
+                            ),
+                        });
+                    }
+                    StampParseError::StampWithoutHashes => {
+                        // This is handled separately below in hash check
+                    }
+                }
+            }
+
+            match self.check_that_stamp_is_updated() {
+                HashCheckResult::HashesShouldBeGenerated => Some(RuleViolationOnFile {
+                    violation: CommentIntegrityRuleViolations::CommentHashNotRegenerated(&self),
+                }),
+                HashCheckResult::CodeHashNotUpToDate | HashCheckResult::BothHashesInvalid => {
+                    Some(RuleViolationOnFile {
+                        violation: CommentIntegrityRuleViolations::CodeChangedCommentNot(&self),
+                    })
+                }
+                HashCheckResult::CommentHashNotUpToDate => Some(RuleViolationOnFile {
+                    violation: CommentIntegrityRuleViolations::CommentHashNotRegenerated(&self),
+                }),
+                HashCheckResult::BothHashesUpToDate => None,
+            }
+        }
+
         pub fn check_that_stamp_is_updated(&self) -> HashCheckResult {
             if self.parse_error.is_some()
                 && self.parse_error.clone().unwrap() == StampParseError::StampWithoutHashes
@@ -1178,17 +1127,17 @@ pub mod models {
 
                     let hash_of_comment = data.get(1).unwrap();
                     self.comment_hash_parsed = hash_of_comment.trim().to_string();
-                    println!(
-                        "This comment is already stamped with comment hash, the hash is: {}",
-                        hash_of_comment
-                    );
+                    // println!(
+                    //     "This comment is already stamped with comment hash, the hash is: {}",
+                    //     hash_of_comment
+                    // );
 
                     let hash_of_code = data.get(2).unwrap();
                     self.code_hash_parsed = hash_of_code.trim().to_string();
-                    println!(
-                        "This comment is already stamped with code hash, the hash is: {}",
-                        hash_of_code
-                    );
+                    // println!(
+                    //     "This comment is already stamped with code hash, the hash is: {}",
+                    //     hash_of_code
+                    // );
                     return Some(start + open_pattern.len() + stamp_end.unwrap());
                 }
             }
