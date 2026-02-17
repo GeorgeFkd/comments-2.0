@@ -6,150 +6,18 @@ use std::iter::Iterator;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use std::{env, fs};
+mod models;
 
 use crate::models::{CommentData, StampParseError};
+use crate::violations::RuleViolationOnFile;
 mod source_code_replacer;
 //General Notes:
 //Saving it to a db might not be ideal, just the parse the project from start everytime
 //There is a file format for how github actions report errors/warnings
 //I dont add warnings/errors for specific rules, leave it up to the user, will provide a sensible
 //default
-
-pub struct RuleViolationOnFile<'a> {
-    violation: CommentIntegrityRuleViolations<'a>,
-}
-#[derive(PartialEq, Eq)]
-pub enum ViolationLevel {
-    Warning,
-    Error,
-    Note,
-}
-
-impl ViolationLevel {
-    pub fn as_str(&self) -> &str {
-        match self {
-            ViolationLevel::Warning => "warning",
-            ViolationLevel::Error => "error",
-            ViolationLevel::Note => "notice",
-        }
-    }
-}
-
-fn violation_to_message<'a>(
-    violation: &'a CommentIntegrityRuleViolations,
-) -> (&'a CommentData<'a>, ViolationLevel, String) {
-    match violation {
-        CommentIntegrityRuleViolations::CommentDoesNotReferenceSpecificCode(comment) => (
-            comment,
-            ViolationLevel::Warning,
-            "Comment does not reference specific code (no stamp found)".to_string(),
-        ),
-        CommentIntegrityRuleViolations::ParseErrorThatShouldBeFixed(comment) => (
-            comment,
-            ViolationLevel::Error,
-            match &comment.parse_error {
-                Some(StampParseError::StampWithoutClosingTag) => {
-                    "stamp missing closing ```".to_string()
-                }
-                Some(StampParseError::StampWithoutLinesReferenced) => {
-                    "stamp missing line count".to_string()
-                }
-                Some(StampParseError::StampWithoutCodeHash) => {
-                    "stamp missing code hash".to_string()
-                }
-                _ => "malformed stamp".to_string(),
-            },
-        ),
-        CommentIntegrityRuleViolations::CodeChangedCommentNot(comment) => (
-            comment,
-            ViolationLevel::Error,
-            format!(
-                "Code hash changed but comment was not updated (expected: {}, actual: {})",
-                comment.code_hash_parsed,
-                comment.hash_code()
-            ),
-        ),
-        CommentIntegrityRuleViolations::CommentHashNotRegenerated(comment) => (
-            comment,
-            ViolationLevel::Warning,
-            format!(
-                "Comment hash needs regeneration (expected: {}, actual: {})",
-                comment.comment_hash_parsed,
-                comment.hash_comment()
-            ),
-        ),
-        CommentIntegrityRuleViolations::CommentThatOthersDependOnChanged(comment) => (
-            comment,
-            ViolationLevel::Error,
-            "Comment changed but other comments depend on it".to_string(),
-        ),
-        CommentIntegrityRuleViolations::CommentThatOthersDependOnDeleted(comment) => (
-            comment,
-            ViolationLevel::Error,
-            "Comment deleted but other comments depend on it".to_string(),
-        ),
-    }
-}
-
-impl<'a> RuleViolationOnFile<'a> {
-    pub fn display_to_user(&self, output_format: &str) -> (String, String) {
-        let (comment, level, message) = violation_to_message(&self.violation);
-        (
-            format_violation(output_format, level.as_str(), comment, &message),
-            level.as_str().to_owned(),
-        )
-    }
-}
-
-fn format_violation(output_format: &str, level: &str, comment: &CommentData, msg: &str) -> String {
-    match output_format {
-        "github" => format!(
-            "::{} file={},line={},col={}::{}",
-            level,
-            comment.file.display(),
-            comment.comment_location.start.row,
-            comment.comment_location.start.column,
-            msg
-        ),
-        _ => format!(
-            "{}:{}:{}: {}: {}",
-            comment.file.display(),
-            comment.comment_location.start.row,
-            comment.comment_location.start.column,
-            level,
-            msg
-        ),
-    }
-}
-
-pub fn display_violations_to_user(
-    violations: &[RuleViolationOnFile],
-    output_format: &str,
-) -> String {
-    if violations.is_empty() {
-        return "No violations found! All comments are up to date.".to_string();
-    }
-
-    let mut result = format!("Found {} violation(s):\n\n", violations.len());
-
-    for (idx, violation) in violations.iter().enumerate() {
-        result.push_str(&violation.display_to_user(output_format).0);
-        if idx < violations.len() - 1 {
-            result.push_str("\n\n");
-        }
-    }
-
-    result
-}
-
-pub enum CommentIntegrityRuleViolations<'a> {
-    CommentDoesNotReferenceSpecificCode(&'a CommentData<'a>),
-    ParseErrorThatShouldBeFixed(&'a CommentData<'a>),
-    CodeChangedCommentNot(&'a CommentData<'a>),
-    CommentHashNotRegenerated(&'a CommentData<'a>),
-    CommentThatOthersDependOnChanged(&'a CommentData<'a>),
-    CommentThatOthersDependOnDeleted(&'a CommentData<'a>),
-}
+mod storage;
+mod violations;
 
 fn position_from_row_col(content: &str, row: u64, col: u64) -> Option<usize> {
     let mut current_row = 0u64;
@@ -177,6 +45,19 @@ fn position_from_row_col(content: &str, row: u64, col: u64) -> Option<usize> {
 type AppError = String;
 
 type AppResult<'a> = Result<Vec<RuleViolationOnFile<'a>>, AppError>;
+
+fn group_comments_by_file<'a>(
+    comments: impl Iterator<Item = &'a CommentData<'a>>,
+) -> HashMap<&'a Path, Vec<&'a CommentData<'a>>> {
+    let mut result: HashMap<&Path, Vec<&CommentData>> = HashMap::new();
+    comments.for_each(|comment| {
+        result
+            .entry(comment.file)
+            .or_insert_with(Vec::new)
+            .push(comment);
+    });
+    result
+}
 
 fn main() -> std::process::ExitCode {
     let program_args = env::args();
@@ -227,6 +108,7 @@ fn main() -> std::process::ExitCode {
     }
 
     let start = Instant::now();
+
     let comment_data_of_files: Vec<models::CommentData> = project_files
         .iter()
         .flat_map(|p| parser::parse_file(p, BufReader::new(File::open(p).unwrap())))
@@ -239,7 +121,7 @@ fn main() -> std::process::ExitCode {
         end.duration_since(start)
     );
 
-    let violations = generate_violations_from_comments(&comment_data_of_files);
+    let violations = violations::generate_violations_from_comments(&comment_data_of_files);
 
     let output_format = options
         .get("output-format")
@@ -249,78 +131,17 @@ fn main() -> std::process::ExitCode {
 
     println!(
         "=====Violations =======\n {} ",
-        display_violations_to_user(violations.as_slice(), output_format)
+        violations::display_violations_to_user(violations.as_slice(), output_format)
     );
-    if !violations.is_empty() {
-        return std::process::ExitCode::FAILURE;
-    }
-    if violations
-        .iter()
-        .map(|rv| violation_to_message(&rv.violation))
-        .any(|v| v.1 == ViolationLevel::Error)
-    {
-        return std::process::ExitCode::FAILURE;
-    }
 
     let should_regenerate_non_hashed_comments = options.get("regenerate");
     if should_regenerate_non_hashed_comments.is_some() {
         println!("Generating hashes for comments that dont already have them.");
-
-        let mut comments_by_file: HashMap<&Path, Vec<&CommentData>> = HashMap::new();
-        comment_data_of_files.iter().for_each(|comment| {
-            comments_by_file
-                .entry(comment.file)
-                .or_insert_with(Vec::new)
-                .push(comment);
-        });
-
-        for (file_path, file_comments) in comments_by_file {
-            let mut content_changes = Vec::new();
-            for comment in file_comments {
-                // Skip comments that should be ignored
-                if comment.should_be_ignored {
-                    continue;
-                }
-                if let Some(ref parse_err) = comment.parse_error {
-                    if *parse_err == StampParseError::StampWithoutHashes {
-                        if let Some(ref stamp_end) = comment.stamp_end {
-                            content_changes.push((
-                                stamp_end.row - 1, // Convert to 0-indexed
-                                stamp_end.column,
-                                format!(" {} {}", comment.hash_comment(), comment.hash_code()),
-                            ));
-                        }
-                    }
-                }
-            }
-            if content_changes.is_empty() {
-                println!("No changes to be made in file {:?}\n", file_path);
-                continue;
-            }
-
-            println!(
-                "Adding {} hash(es) to {}",
-                content_changes.len(),
-                file_path.display()
-            );
-
-            let reader = BufReader::new(
-                File::open(file_path).expect(&format!("File could not be opened {:?}", file_path)),
-            );
-
-            //This is a bit awkward should sometime be fixed ```comments-2.0 4 132957344 13295432557734468097```
-            let content_changes_refs: Vec<(usize, usize, &str)> = content_changes
-                .iter()
-                .map(|(row, col, s)| (*row, *col, s.as_str()))
-                .collect();
-
-            let modified_content =
-                source_code_replacer::with_multiple_added_content_at(reader, content_changes_refs)
-                    .map_err(|e| format!("Failed to modify {}: {}", file_path.display(), e))
-                    .unwrap();
-            fs::write(file_path, modified_content)
-                .map_err(|e| format!("Failed to write file {}: {}", file_path.display(), e))
-                .unwrap();
+        let comments_per_file = group_comments_by_file(comment_data_of_files.iter());
+        if let Err(e) =
+            source_code_replacer::regenerate_hashes_in_files(comments_per_file.into_iter())
+        {
+            eprintln!("Something went wrong when generating the hashes for files: {e}");
         }
 
         println!("Hash generation complete.");
@@ -328,7 +149,7 @@ fn main() -> std::process::ExitCode {
         println!("Not generating hashes for comments that dont already have them.");
     }
 
-    return std::process::ExitCode::SUCCESS;
+    return violations::determine_exit_code(violations.as_slice());
     // let result = comment_data_of_files.len();
     // println!("The project comments are: {}\n", result);
     // let db_option = options.get("db");
@@ -336,7 +157,7 @@ fn main() -> std::process::ExitCode {
     //     None => "comments.sqlite".to_owned(),
     //     Some(db) => db.to_owned(),
     // };
-
+    //
     // println!("Storing them in db: {db_file}\n");
     // let start = Instant::now();
     // let result = storage::store_in_sqlite(&db_file, &comment_data_of_files, 500);
@@ -351,15 +172,6 @@ fn main() -> std::process::ExitCode {
     //     );
     //     return std::process::ExitCode::SUCCESS;
     // }
-}
-
-fn generate_violations_from_comments<'a>(
-    comments_of_project: &'a Vec<CommentData<'a>>,
-) -> Vec<RuleViolationOnFile<'a>> {
-    comments_of_project
-        .iter()
-        .filter_map(CommentData::get_violation)
-        .collect()
 }
 
 fn help_page() -> String {
@@ -557,212 +369,6 @@ fn are_args_valid(args: &HashMap<String, String>) -> Result<(), &'static str> {
     return Ok(());
 }
 
-mod storage {
-    use super::models;
-    use rusqlite::{Connection, OpenFlags, params};
-    use std::path::PathBuf;
-
-    //might add a connection with a mutex here
-    pub struct SqliteDB {
-        file: PathBuf,
-    }
-
-    impl SqliteDB {
-        pub fn new(file: PathBuf) -> Self {
-            return Self { file };
-        }
-    }
-
-    pub fn store_in_sqlite(
-        file: &String,
-        data: &Vec<models::CommentData>,
-        records_per_db_transaction: usize,
-    ) -> Result<(), String> {
-        let db = SqliteDB::new(file.into());
-        db.store_batch(data, records_per_db_transaction)
-    }
-
-    impl Storage for SqliteDB {
-        fn store_batch(
-            &self,
-            data: &Vec<models::CommentData<'_>>,
-            records_per_transaction: usize,
-        ) -> Result<(), String> {
-            let conn = Connection::open_with_flags(
-                &self.file,
-                OpenFlags::SQLITE_OPEN_READ_WRITE
-                    | OpenFlags::SQLITE_OPEN_URI
-                    | OpenFlags::SQLITE_OPEN_CREATE
-                    | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-            );
-            match conn {
-                Err(e) => return Err(e.to_string()),
-                Ok(mut conn) => {
-                    println!(
-                        "A connection was successfully made in {}\n ",
-                        conn.path().unwrap()
-                    );
-
-                    //i dont like the created_at timestamp it is useless, it should have an author
-                    //instead and a time of change ```comments-2.0 1 12772118682245448942 12772118682245448942```
-                    let initialize_db_command = conn.prepare(
-                        "
-CREATE TABLE IF NOT EXISTS Comments(
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    contents TEXT NOT NULL,
-    code TEXT,
-    contents_hash TEXT,
-    code_hash TEXT,
-    file_path TEXT NOT NULL,
-    row INTEGER,              -- starting line or row number in file
-    column INTEGER,           -- column position in file
-    lines_of_code INTEGER,    -- how many lines of code the comment refers to
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);",
-                    );
-                    let res = initialize_db_command
-                        .expect("Something went wrong when trying to create tables")
-                        .execute([]);
-
-                    let mut index_initialisation = conn.prepare(
-                        "CREATE INDEX IF NOT EXISTS idx_comments_file_path ON Comments(file_path);",
-                    );
-
-                    index_initialisation
-                        .expect("Something went wrong when trying to create index statement for db")
-                        .execute([])
-                        .expect("Could not execute index creation statement");
-                    if res.is_err() {
-                        return Err(res.err().unwrap().to_string());
-                    }
-                    //the chunk size is 100 arbitrarily, to avoid long uncommitted transactions
-                    //```comments-2.0 1 16704368689317473269 16704368689317473269```
-                    for chunk in data.chunks(records_per_transaction) {
-                        //i manually start and stop the transaction in order to
-                        //make it faster by avoiding too many transactions ```comments-2.0 1 6643353057262408975 6643353057262408975```
-                        let tx = conn.transaction().unwrap();
-                        {
-                            let mut stmt = tx
-                                .prepare(
-                                    "INSERT INTO Comments
-            (contents, code, contents_hash, code_hash, file_path, row, column, lines_of_code)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                                )
-                                .expect("something went wrong when preparing hash");
-
-                            for comment in chunk {
-                                let file_path_str = comment.file.to_str().unwrap();
-
-                                stmt.execute(params![
-                                &comment.raw_contents,
-                                &comment.code_it_refers_to,
-                                &comment.hash_comment(),
-                                &comment.hash_code(),
-                                file_path_str,
-                                comment.comment_location.start.row,
-                                comment.comment_location.start.column,
-                                comment.lines_of_code_referenced,
-                            ])
-                            .expect(
-                                "Something went wrong when trying to execute an INSERT statement",
-                            );
-                            }
-                        }
-                        tx.commit().unwrap();
-                    }
-                    return Ok(());
-                }
-            }
-        }
-
-        fn store(&self, comment: &models::CommentData) -> Result<(), String> {
-            let conn = Connection::open_with_flags(
-                &self.file,
-                OpenFlags::SQLITE_OPEN_READ_WRITE
-                    | OpenFlags::SQLITE_OPEN_URI
-                    | OpenFlags::SQLITE_OPEN_CREATE
-                    | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-            )
-            .expect("Something went wrong when opening the db to write");
-            let mut stmt = conn
-                .prepare(
-                    "INSERT INTO Comments
-            (contents, code, contents_hash, code_hash, file_path, row, column, lines_of_code)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                )
-                .expect("something went wrong when preparing hash");
-
-            stmt.execute(params![
-                &comment.raw_contents,
-                &comment.code_it_refers_to,
-                &comment.hash_comment(),
-                &comment.hash_code(),
-                comment.file.to_str().unwrap(),
-                comment.comment_location.start.row,
-                comment.comment_location.start.column,
-                comment.lines_of_code_referenced,
-            ])
-            .expect("Something went wrong when trying to execute an INSERT statement");
-            println!("inserted one record into db");
-            return Ok(());
-        }
-
-        fn read_all(&self) -> Vec<models::CommentData> {
-            todo!();
-        }
-
-        fn get_total_comments_count(&self) -> u64 {
-            std::todo!();
-        }
-
-        fn get_comments_count_per_file(&self) -> (String, u64) {
-            std::todo!();
-        }
-
-        fn dump_contents_human_readable(&self) -> String {
-            std::todo!();
-        }
-
-        fn raw_contents(&self) -> String {
-            std::todo!();
-        }
-    }
-
-    pub trait Storage {
-        //i might need to make this async in the future or just throw it in a different thread
-        fn store(&self, data: &models::CommentData) -> Result<(), String> {
-            return Ok(());
-        }
-
-        fn store_batch(
-            &self,
-            data: &Vec<models::CommentData>,
-            records_per_transaction: usize,
-        ) -> Result<(), String> {
-            Ok(())
-        }
-
-        fn read_all(&self) -> Vec<models::CommentData> {
-            todo!();
-        }
-
-        fn get_total_comments_count(&self) -> u64 {
-            todo!();
-        }
-
-        fn get_comments_count_per_file(&self) -> (String, u64) {
-            todo!();
-        }
-
-        fn dump_contents_human_readable(&self) -> String {
-            todo!();
-        }
-
-        fn raw_contents(&self) -> String {
-            todo!();
-        }
-    }
-}
 mod parser {
     use crate::models::{CommentData, SourceLocation};
 
@@ -930,297 +536,9 @@ mod parser {
             .collect()
     }
 }
-pub mod models {
-    use std::{
-        hash::{DefaultHasher, Hash, Hasher},
-        path::Path,
-    };
-
-    use crate::{CommentIntegrityRuleViolations, RuleViolationOnFile};
-
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub enum StampParseError {
-        NoStampFound,
-        StampWithoutClosingTag,
-        StampWithoutLinesReferenced,
-        StampWithoutHashes,
-        StampWithoutCodeHash,
-    }
-
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub enum HashCheckResult {
-        BothHashesInvalid,
-        CodeHashNotUpToDate,
-        CommentHashNotUpToDate,
-        BothHashesUpToDate,
-        HashesShouldBeGenerated,
-    }
-
-    // i need a different struct for the parser and the db
-    #[derive(Debug)]
-    pub struct CommentData<'a> {
-        pub comment_location: SourceRange,
-        pub stamp_end: Option<SourceLocation>,
-        //used in the generation of the hash
-        pub raw_contents: String,
-        pub code_it_refers_to: String,
-
-        //most of the fields should be optional, to signal when they are unstamped
-        pub lines_of_code_referenced: u16,
-        pub should_be_ignored: bool, //when the user inputs 0 as the lines referenced i should not
-        //bother with it
-        pub lines_of_code_read: u16,
-        pub file: &'a Path,
-
-        pub code_hash_parsed: String,
-        pub comment_hash_parsed: String,
-        pub parse_error: Option<StampParseError>,
-    }
-
-    impl<'a> CommentData<'a> {
-        pub fn get_violation(&self) -> Option<RuleViolationOnFile<'_>> {
-            if self.should_be_ignored {
-                return None;
-            }
-
-            // Check for parse errors first
-            if let Some(ref parse_err) = self.parse_error {
-                match parse_err {
-                    StampParseError::NoStampFound => {
-                        return Some(RuleViolationOnFile {
-                            violation:
-                                CommentIntegrityRuleViolations::CommentDoesNotReferenceSpecificCode(
-                                    &self,
-                                ),
-                        });
-                    }
-                    StampParseError::StampWithoutClosingTag
-                    | StampParseError::StampWithoutLinesReferenced
-                    | StampParseError::StampWithoutCodeHash => {
-                        return Some(RuleViolationOnFile {
-                            violation: CommentIntegrityRuleViolations::ParseErrorThatShouldBeFixed(
-                                &self,
-                            ),
-                        });
-                    }
-                    StampParseError::StampWithoutHashes => {
-                        // This is handled separately below in hash check
-                    }
-                }
-            }
-
-            match self.check_that_stamp_is_updated() {
-                HashCheckResult::HashesShouldBeGenerated => Some(RuleViolationOnFile {
-                    violation: CommentIntegrityRuleViolations::CommentHashNotRegenerated(&self),
-                }),
-                HashCheckResult::CodeHashNotUpToDate | HashCheckResult::BothHashesInvalid => {
-                    Some(RuleViolationOnFile {
-                        violation: CommentIntegrityRuleViolations::CodeChangedCommentNot(&self),
-                    })
-                }
-                HashCheckResult::CommentHashNotUpToDate => Some(RuleViolationOnFile {
-                    violation: CommentIntegrityRuleViolations::CommentHashNotRegenerated(&self),
-                }),
-                HashCheckResult::BothHashesUpToDate => None,
-            }
-        }
-
-        pub fn check_that_stamp_is_updated(&self) -> HashCheckResult {
-            if self.parse_error.is_some()
-                && self.parse_error.clone().unwrap() == StampParseError::StampWithoutHashes
-            {
-                return HashCheckResult::HashesShouldBeGenerated;
-            }
-            let code_hash_is_updated = self.hash_code() == self.code_hash_parsed;
-            let comment_hash_is_updated = self.hash_comment() == self.comment_hash_parsed;
-            if code_hash_is_updated && comment_hash_is_updated {
-                return HashCheckResult::BothHashesUpToDate;
-            }
-
-            if code_hash_is_updated && !comment_hash_is_updated {
-                return HashCheckResult::CommentHashNotUpToDate;
-            }
-
-            if !code_hash_is_updated && comment_hash_is_updated {
-                return HashCheckResult::CodeHashNotUpToDate;
-            }
-            return HashCheckResult::BothHashesInvalid;
-        }
-
-        pub fn empty() -> Self {
-            Self {
-                should_be_ignored: false,
-                comment_location: SourceRange {
-                    start: SourceLocation::empty(),
-                    end: SourceLocation::empty(),
-                },
-                raw_contents: "".into(),
-                file: &Path::new(""),
-                code_it_refers_to: "".into(),
-                lines_of_code_referenced: 0,
-                lines_of_code_read: 0,
-                code_hash_parsed: "".into(),
-                comment_hash_parsed: "".into(),
-                parse_error: Some(StampParseError::NoStampFound),
-                stamp_end: None,
-            }
-        }
-
-        pub fn push_comment(&mut self, string: &str) -> Option<usize> {
-            //should ignore the part of the string that
-            //has the comments-2.0 stamp
-            //and also parse that part to see how many lines of code should be parsed next
-            let open_pattern = "```comments-2.0";
-            let close_pattern = "```";
-            let stamp_start = string.find(open_pattern);
-            // println!("Stamp start: {:?}", stamp_start);
-
-            match stamp_start {
-                None => {
-                    self.raw_contents.push('\n');
-                    self.raw_contents.push_str(string);
-                    return None;
-                }
-
-                Some(start) => {
-                    self.raw_contents.push('\n');
-                    self.raw_contents.push_str(&string[0..start]);
-
-                    let remaining = &string[start + open_pattern.len()..];
-                    // println!("Remaining is: {}", remaining); ```comments-2.0 0```
-                    let stamp_end = remaining.find(close_pattern);
-                    if stamp_end.is_none() {
-                        self.parse_error = Some(StampParseError::StampWithoutClosingTag);
-                        return None;
-                    }
-                    //parse the slice in between
-                    //in the future it is possible to just use json here and parse it with
-                    //serde, not required rn
-                    let stamp_slice = remaining[0..stamp_end.unwrap()].trim();
-                    // println!("Stamp slice is: {:?}", stamp_slice);
-                    let data: Vec<&str> = stamp_slice.split(" ").collect();
-                    let parse_error = match data.len() {
-                        0 => Some(StampParseError::StampWithoutLinesReferenced),
-                        1 => Some(StampParseError::StampWithoutHashes),
-                        2 => Some(StampParseError::StampWithoutCodeHash),
-                        _ => None,
-                    };
-                    self.parse_error = parse_error.clone();
-                    // println!("Extra data is: {:?}", data);
-                    let lines_referenced = data.get(0).unwrap();
-                    // println!(
-                    //     "This comment references the next {} lines of code",
-                    //     lines_referenced
-                    // );
-                    let parsed_num = lines_referenced.parse().expect(
-                        &format!("Could not parse the lines of code number of the ```comments-2.0 ``` stamp at {}:{}:{}",self.file.display(),self.comment_location.start.row,self.comment_location.start.column
-                    ));
-                    self.lines_of_code_referenced = parsed_num;
-                    //user wants us to ignore this comment ```comments-2.0 3 427109853614679882 427109853614679882```
-                    if parsed_num == 0 {
-                        self.should_be_ignored = true;
-                    }
-
-                    if parse_error.is_some() {
-                        return Some(start + open_pattern.len() + stamp_end.unwrap());
-                    }
-
-                    let hash_of_comment = data.get(1).unwrap();
-                    self.comment_hash_parsed = hash_of_comment.trim().to_string();
-                    // println!(
-                    //     "This comment is already stamped with comment hash, the hash is: {}",
-                    //     hash_of_comment
-                    // );
-
-                    let hash_of_code = data.get(2).unwrap();
-                    self.code_hash_parsed = hash_of_code.trim().to_string();
-                    // println!(
-                    //     "This comment is already stamped with code hash, the hash is: {}",
-                    //     hash_of_code
-                    // );
-                    return Some(start + open_pattern.len() + stamp_end.unwrap());
-                }
-            }
-        }
-
-        pub fn push_code(&mut self, string: &str) {
-            self.code_it_refers_to.push_str(string);
-            self.code_it_refers_to.push('\n');
-        }
-    }
-
-    impl<'a> CommentData<'a> {
-        pub fn hash_comment(&self) -> String {
-            //using only the code contents and the filename, also the content should first be split into
-            //words, also certain characters should be ignored. ```comments-2.0 1 15156721570910937981 15156721570910937981```
-            let mut state = DefaultHasher::new();
-            let normalized: Vec<String> = self
-                .raw_contents
-                .split_whitespace() // split into words
-                .map(|word| {
-                    word.chars()
-                        .filter(|c| c.is_alphanumeric()) // keep only alphanumeric
-                        .collect::<String>()
-                })
-                .filter(|s| !s.is_empty()) // skip empty words
-                .collect();
-
-            for word in normalized {
-                word.hash(&mut state);
-            }
-
-            self.file.hash(&mut state);
-            return state.finish().to_string();
-        }
-
-        //using only the code contents and the filename, also the content should first be split into
-        //words, also certain characters should be ignored. ```comments-2.0 1 15156721570910937981 15156721570910937981```
-        pub fn hash_code(&self) -> String {
-            //might need to implement a custom one at some point ```comments-2.0 1 5703807205826246641 5703807205826246641```
-            let mut state = DefaultHasher::new();
-            let normalized: Vec<String> = self
-                .raw_contents
-                .split_whitespace() // split into words
-                .map(|word| {
-                    word.chars()
-                        .filter(|c| c.is_alphanumeric()) // keep only alphanumeric
-                        .collect::<String>()
-                })
-                .filter(|s| !s.is_empty()) // skip empty words
-                .collect();
-
-            for word in normalized {
-                word.hash(&mut state);
-            }
-
-            self.file.hash(&mut state);
-            return state.finish().to_string();
-        }
-    }
-
-    #[derive(Debug)]
-    pub struct SourceLocation {
-        pub row: usize,
-        //column will now not be used yet
-        pub column: usize,
-    }
-
-    impl SourceLocation {
-        pub fn empty() -> Self {
-            Self { row: 0, column: 0 }
-        }
-    }
-
-    #[derive(Debug)]
-    pub struct SourceRange {
-        pub start: SourceLocation,
-        pub end: SourceLocation,
-    }
-}
 
 #[cfg(test)]
 mod tests {
-
     mod comments {
         use crate::{CommentData, models::StampParseError};
 
@@ -1606,4 +924,3 @@ console.log(`Line 4`)
     //     todo!();
     // }
 }
-

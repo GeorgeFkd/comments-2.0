@@ -1,5 +1,76 @@
 use std::io::BufRead;
 
+use crate::models::{CommentData, StampParseError};
+use std::fs;
+use std::fs::File;
+use std::io::BufReader;
+use std::path::Path;
+
+pub fn regenerate_hashes_in_files<'a>(
+    comments_by_file: impl Iterator<Item = (&'a Path, Vec<&'a CommentData<'a>>)>,
+) -> Result<(), String> {
+    for (file_path, file_comments) in comments_by_file {
+        let content_changes = collect_hash_insertions(&file_comments);
+
+        if content_changes.is_empty() {
+            println!("No changes to be made in file {}", file_path.display());
+            continue;
+        }
+
+        apply_hash_insertions(file_path, content_changes)?;
+    }
+
+    println!("Hash generation complete.");
+    Ok(())
+}
+
+fn collect_hash_insertions(comments: &[&CommentData]) -> Vec<(usize, usize, String)> {
+    comments
+        .iter()
+        .filter(|c| !c.should_be_ignored)
+        .filter_map(|comment| {
+            if let Some(StampParseError::StampWithoutHashes) = comment.parse_error {
+                if let Some(ref stamp_end) = comment.stamp_end {
+                    return Some((
+                        stamp_end.row - 1,
+                        stamp_end.column,
+                        format!(" {} {}", comment.hash_comment(), comment.hash_code()),
+                    ));
+                }
+            }
+            None
+        })
+        .collect()
+}
+
+fn apply_hash_insertions(
+    file_path: &Path,
+    content_changes: Vec<(usize, usize, String)>,
+) -> Result<(), String> {
+    println!(
+        "Adding {} hash(es) to {}",
+        content_changes.len(),
+        file_path.display()
+    );
+
+    let reader = BufReader::new(
+        File::open(file_path)
+            .map_err(|e| format!("Failed to open {}: {}", file_path.display(), e))?,
+    );
+
+    let content_changes_refs: Vec<(usize, usize, &str)> = content_changes
+        .iter()
+        .map(|(row, col, s)| (*row, *col, s.as_str()))
+        .collect();
+
+    let modified_content = with_multiple_added_content_at(reader, content_changes_refs)?;
+
+    fs::write(file_path, modified_content)
+        .map_err(|e| format!("Failed to write {}: {}", file_path.display(), e))?;
+
+    Ok(())
+}
+
 pub fn with_multiple_added_content_at<T: BufRead>(
     reader: T,
     content_changes: Vec<(usize, usize, &str)>,
