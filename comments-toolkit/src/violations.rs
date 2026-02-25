@@ -1,5 +1,5 @@
 use crate::models::{CommentData, HashCheckResult, StampParseError};
-
+use std::ops::Fn;
 pub struct RuleViolationOnFile<'a> {
     pub violation: CommentIntegrityRuleViolations,
     pub comment: &'a CommentData<'a>,
@@ -93,14 +93,16 @@ fn format_violation(output_format: &str, level: &str, comment: &CommentData, msg
             comment.comment_location.start.column,
             msg
         ),
-        _ => format!(
+        "editor" => format!(
             "{}:{}:{}: {}: {}",
             comment.file.display(),
             comment.comment_location.start.row,
-            comment.comment_location.start.column,
+            //the cursor is at a slightly wrong place this is a temp fix ```comments-2.0 1```
+            comment.comment_location.start.column + 1,
             level,
             msg
         ),
+        _ => format!("Not a valid output format {output_format}"),
     }
 }
 
@@ -133,7 +135,7 @@ pub enum CommentIntegrityRuleViolations {
     CommentThatOthersDependOnDeleted,
 }
 
-//this function will be configurable to return success/failure based on user input ```comments-2.0 16``
+//this function will be configurable to return success/failure based on user input ```comments-2.0 16```
 pub fn determine_exit_code(violations: &[RuleViolationOnFile]) -> std::process::ExitCode {
     if violations.is_empty() {
         return std::process::ExitCode::SUCCESS;

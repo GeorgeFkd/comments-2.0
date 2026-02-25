@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env::Args;
 use std::fs::{File, read_dir};
 use std::io::BufReader;
@@ -59,6 +59,24 @@ fn group_comments_by_file<'a>(
     result
 }
 
+fn get_changed_files_from_git(file_extensions: &[String]) -> HashSet<PathBuf> {
+    let output = std::process::Command::new("git")
+        .args(&["diff", "--name-only", "HEAD"])
+        .output()
+        .expect("Failed to run git diff");
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(PathBuf::from)
+        .filter(|path| {
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| file_extensions.contains(&ext.to_string()))
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
 fn main() -> std::process::ExitCode {
     let program_args = env::args();
 
@@ -99,7 +117,6 @@ fn main() -> std::process::ExitCode {
         &file_extensions,
     );
 
-    println!("Will process {} project files", project_files.len());
     let threads = get_threads_to_use(project_files.len() as u64);
     if threads.is_some() {
         println!("Will use {} threads", threads.unwrap());
@@ -108,8 +125,33 @@ fn main() -> std::process::ExitCode {
     }
 
     let start = Instant::now();
-
-    let comment_data_of_files: Vec<models::CommentData> = project_files
+    let filter = options.get("filter").map(String::as_str);
+    let files_to_process: Vec<_> = match filter {
+        None => project_files,
+        Some(filter_choice) => {
+            if filter_choice.starts_with("diff") {
+                println!("Getting only changed files from git");
+                let changed_files = get_changed_files_from_git(&file_extensions);
+                project_files
+                    .into_iter()
+                    .filter(|p| changed_files.iter().any(|cf| p.ends_with(cf)))
+                    .collect()
+            } else if filter_choice.starts_with("file=") {
+                let specified_files: HashSet<PathBuf> = filter_choice["file=".len()..]
+                    .split(',')
+                    .map(|s| PathBuf::from(s.trim()))
+                    .collect();
+                project_files
+                    .into_iter()
+                    .filter(|p| specified_files.iter().any(|sf| p.ends_with(sf)))
+                    .collect()
+            } else {
+                project_files
+            }
+        }
+    };
+    println!("Will process {} project files", files_to_process.len());
+    let comment_data_of_files: Vec<models::CommentData> = files_to_process
         .iter()
         .flat_map(|p| parser::parse_file(p, BufReader::new(File::open(p).unwrap())))
         .collect();
@@ -117,7 +159,7 @@ fn main() -> std::process::ExitCode {
     //50k files in 13 seconds for the llvm project with some dirs excluded
     println!(
         "Completed comments parsing {} files in {:?}",
-        project_files.len(),
+        files_to_process.len(),
         end.duration_since(start)
     );
 
@@ -270,7 +312,7 @@ fn get_threads_to_use(files_to_process: u64) -> Option<usize> {
     let os = env::consts::OS;
     assert!(os == "linux");
     let meminfo_contents = fs::read_to_string(Path::new("/proc/meminfo")).unwrap();
-    //the records are in the form <label>:\t number kB
+    //the records are in the form <label>:\t number kB ```comments-2.0 9 11249214323271872503 11249214323271872503```
     let available_memory = meminfo_contents
         .lines()
         .into_iter()
@@ -823,3 +865,4 @@ console.log(`Line 4`)
     //     todo!();
     // }
 }
+
