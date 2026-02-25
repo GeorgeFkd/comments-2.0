@@ -64,8 +64,14 @@ fn get_changed_files_from_git(file_extensions: &[String]) -> HashSet<PathBuf> {
         .args(&["diff", "--name-only", "HEAD"])
         .output()
         .expect("Failed to run git diff");
-
-    String::from_utf8_lossy(&output.stdout)
+    let output = String::from_utf8(output.stdout).unwrap();
+    println!("Git output: {}", &output);
+    println!("File extensions: {:?}", file_extensions);
+    println!(
+        "Contains: {:?}",
+        file_extensions.contains(&"rs".to_string())
+    );
+    output
         .lines()
         .map(PathBuf::from)
         .filter(|path| {
@@ -132,9 +138,18 @@ fn main() -> std::process::ExitCode {
             if filter_choice.starts_with("diff") {
                 println!("Getting only changed files from git");
                 let changed_files = get_changed_files_from_git(&file_extensions);
+                println!("Changed files: {:?}", changed_files);
                 project_files
                     .into_iter()
-                    .filter(|p| changed_files.iter().any(|cf| p.ends_with(cf)))
+                    .inspect(|pb| println!("Path: {:?}", pb))
+                    .filter(|p| {
+                        let p_str = p.to_string_lossy();
+                        let p_clean = p_str.strip_prefix("./").unwrap_or(&p_str);
+                        let res = changed_files
+                            .iter()
+                            .any(|cf| cf.to_string_lossy().ends_with(p_clean));
+                        return res;
+                    })
                     .collect()
             } else if filter_choice.starts_with("file=") {
                 let specified_files: HashSet<PathBuf> = filter_choice["file=".len()..]
@@ -865,4 +880,3 @@ console.log(`Line 4`)
     //     todo!();
     // }
 }
-
