@@ -21,7 +21,7 @@ jobs:
       - name: Build
         run: cargo build --release --target x86_64-unknown-linux-musl
       - name: Package
-        run: tar -czf Linux-x86_64.tgz -C target/x86_64-unknown-linux-musl/release/comments-toolkit
+        run: tar -czf Linux-x86_64.tgz -C target/x86_64-unknown-linux-musl/release/ comments-toolkit
       - name: Store Archive
         uses: actions/upload-artifact@v4
         with:
