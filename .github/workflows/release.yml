@@ -8,6 +8,9 @@ on:
 jobs:
   build-artifacts:
     runs-on: ubuntu-latest
+    defaults:
+        run:
+          working-directory: ./comments-toolkit
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
