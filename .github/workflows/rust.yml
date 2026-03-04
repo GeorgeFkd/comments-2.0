@@ -1,0 +1,27 @@
+name: Rust
+on:
+  push:
+    branches: [ "*" ]
+  pull_request:
+    branches: [ "*" ]
+env:
+  CARGO_TERM_COLOR: always
+  RUST_VERSION: "1.91"
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Update Rust
+      run: |
+          rustup override set ${{ env.RUST_VERSION }}
+          rustup update ${{ env.RUST_VERSION }}
+    - uses: Swatinem/rust-cache@v2
+    - name: Build
+      run: cargo build --verbose
+    - name: Run tests
+      run: cargo test --verbose
+    - name: Check formatting
+      run: cargo fmt --check
+    - name: Run linter
+      run: cargo clippy
