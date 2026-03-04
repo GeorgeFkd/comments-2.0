@@ -21,12 +21,12 @@ jobs:
       - name: Build
         run: cargo build --release --target x86_64-unknown-linux-musl
       - name: Package
-        run: tar -czf Linux-x86_64.tgz -C target/x86_64-unknown-linux-musl/release
+        run: tar -czf Linux-x86_64.tgz -C target/x86_64-unknown-linux-musl/release/comments-toolkit
       - name: Store Archive
         uses: actions/upload-artifact@v4
         with:
-          name: Linux
-          path: Linux.tgz
+          name: Linux-x86_64
+          path: comments-toolkit/Linux-x86_64.tgz
   create-release:
     needs: [build-artifacts]
     runs-on: ubuntu-latest
@@ -38,5 +38,5 @@ jobs:
       - name: Create Release
         uses: ncipollo/release-action@v1
         with:
-          artifacts: "Linux-x86_64/Linux.tgz"
+          artifacts: "Linux-x86_64/Linux-x86_64.tgz"
           tag: v${{ github.event.inputs.version }}
