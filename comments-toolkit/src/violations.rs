@@ -48,6 +48,10 @@ fn violation_to_message<'a>(
             ViolationLevel::Error,
             "Comment deleted but other comments depend on it".to_string(),
         ),
+        CommentIntegrityRuleViolations::DependsOnCommentThatDoesntExist => (
+            ViolationLevel::Error,
+            "Comment depends on comment that has been deleted".to_string(),
+        ),
     }
 }
 
@@ -86,25 +90,27 @@ impl<'a> RuleViolationOnFile<'a> {
 fn format_violation(output_format: &str, level: &str, comment: &CommentData, msg: &str) -> String {
     match output_format {
         "github" => format!(
-            "::{} file={},line={},col={}::{} deps: {:?}",
+            "::{} file={},line={},col={}::{} deps: {:?} id: {}",
             level,
             comment.file.display(),
             comment.comment_location.start.row,
             comment.comment_location.start.column,
             msg,
-            comment.dependency_list_parsed
+            comment.dependency_list_parsed,
+            comment.id
         ),
         "editor" => format!(
-            "{}:{}:{}: {}: {} deps: {:?} comment {:?}...",
+            "{}:{}:{}: {}: {} deps: {:?} id: {}",
             comment.file.display(),
             comment.comment_location.start.row,
-            //the cursor is at a slightly wrong place this is a temp fix ```comments-2.0 1 4395583177411532991 4395583177411532991```
+            //the cursor is at a slightly wrong place this is a temp fix ```comments-2.0 1 4395583177411532991 4395583177411532991 13```
             comment.comment_location.start.column + 1,
             level,
             msg,
             comment.dependency_list_parsed,
-            comment.raw_contents
+            comment.id
         ),
+        //TODO: csv and db output
         _ => format!("Not a valid output format {output_format}"),
     }
 }
@@ -136,9 +142,10 @@ pub enum CommentIntegrityRuleViolations {
     CommentHashNotRegenerated,
     CommentThatOthersDependOnChanged,
     CommentThatOthersDependOnDeleted,
+    DependsOnCommentThatDoesntExist,
 }
 
-//this function will be configurable to return success/failure based on user input ```comments-2.0 16 14130792760320861292 14130792760320861292```
+//this function will be configurable to return success/failure based on user input ```comments-2.0 16 14130792760320861292 14130792760320861292 14```
 pub fn determine_exit_code(violations: &[RuleViolationOnFile]) -> std::process::ExitCode {
     if violations.is_empty() {
         return std::process::ExitCode::SUCCESS;
@@ -201,12 +208,42 @@ fn get_violation<'a>(comment: &'a CommentData<'a>) -> Option<RuleViolationOnFile
         HashCheckResult::BothHashesUpToDate => None,
     }
 }
+
+fn get_dependecy_violations<'a>(
+    comments_of_project: &'a Vec<CommentData<'a>>,
+) -> Vec<RuleViolationOnFile<'a>> {
+    let comments_with_dependencies = comments_of_project
+        .iter()
+        .filter(|cm| cm.dependency_list_parsed.len() > 0);
+    let mut result = vec![];
+    for cm_with_deps in comments_with_dependencies {
+        for dep in cm_with_deps.dependency_list_parsed.iter() {
+            let found = comments_of_project
+                .iter()
+                .find(|cm| cm.id.to_owned().eq(&dep.0));
+            if found.is_none() {
+                println!(
+                    "Found a dependency violation for comment: {:?}",
+                    cm_with_deps.raw_contents
+                );
+                result.push(RuleViolationOnFile {
+                    comment: cm_with_deps,
+                    violation: CommentIntegrityRuleViolations::DependsOnCommentThatDoesntExist,
+                });
+            }
+        }
+    }
+    return result;
+}
+
 pub fn generate_violations_from_comments<'a>(
     comments_of_project: &'a Vec<CommentData<'a>>,
 ) -> Vec<RuleViolationOnFile<'a>> {
-    comments_of_project
+    let mut violations_within_comment: Vec<RuleViolationOnFile<'_>> = comments_of_project
         .iter()
         .filter_map(get_violation)
-        .collect()
+        .collect();
+    let violations_between_comments = get_dependecy_violations(comments_of_project);
+    violations_within_comment.extend(violations_between_comments);
+    return violations_within_comment;
 }
-

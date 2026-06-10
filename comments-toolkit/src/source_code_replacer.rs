@@ -8,39 +8,54 @@ use std::path::Path;
 
 pub fn regenerate_hashes_in_files<'a>(
     comments_by_file: impl Iterator<Item = (&'a Path, Vec<&'a CommentData<'a>>)>,
+    latest_id: u64,
 ) -> Result<(), String> {
+    let mut current_id = latest_id;
     for (file_path, file_comments) in comments_by_file {
-        let content_changes = collect_hash_insertions(&file_comments);
+        let content_changes = collect_hash_insertions(&file_comments, current_id);
 
-        if content_changes.is_empty() {
+        if content_changes.0.is_empty() {
             println!("No changes to be made in file {}", file_path.display());
             continue;
         }
 
-        apply_hash_insertions(file_path, content_changes)?;
+        apply_hash_insertions(file_path, content_changes.0)?;
+        current_id = content_changes.1;
     }
 
     println!("Hash generation complete.");
     Ok(())
 }
 
-fn collect_hash_insertions(comments: &[&CommentData]) -> Vec<(usize, usize, String)> {
-    comments
+fn collect_hash_insertions(
+    comments: &[&CommentData],
+    last_id: u64,
+) -> (Vec<(usize, usize, String)>, u64) {
+    let mut current_id = last_id.clone();
+    let result = comments
         .iter()
         .filter(|c| !c.should_be_ignored)
         .filter_map(|comment| {
             if let Some(StampParseError::StampWithoutHashes) = comment.parse_error {
                 if let Some(ref stamp_end) = comment.stamp_end {
+                    let comment_id = CommentData::generate_next_id(current_id);
+                    current_id = comment_id.clone();
                     return Some((
                         stamp_end.row - 1,
                         stamp_end.column,
-                        format!(" {} {}", comment.hash_comment(), comment.hash_code()),
+                        format!(
+                            " {} {} {}",
+                            comment.hash_comment(),
+                            comment.hash_code(),
+                            comment_id
+                        ),
                     ));
                 }
             }
             None
         })
-        .collect()
+        .collect();
+    return (result, current_id);
 }
 
 fn apply_hash_insertions(

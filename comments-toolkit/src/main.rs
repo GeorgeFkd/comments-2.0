@@ -41,7 +41,7 @@ fn position_from_row_col(content: &str, row: u64, col: u64) -> Option<usize> {
     None // Row not found
 }
 
-//this might become an enum ```comments-2.0 1 1489893222977162209 148989362209```
+//this might become an enum ```comments-2.0 1 1489893222977162209 1489893222977162209 10```
 type AppError = String;
 
 type AppResult<'a> = Result<Vec<RuleViolationOnFile<'a>>, AppError>;
@@ -105,7 +105,7 @@ fn main() -> std::process::ExitCode {
         .map(String::from)
         .collect();
 
-    //for each language i could write the ignored-dirs myself ```comments-2.0 3 17485437293245936657 17485437293245936657```
+    //for each language i could write the ignored-dirs myself ```comments-2.0 3 17485437293245936657 17485437293245936657 11```
     let ignored_dirs = options
         .get("ignored-dirs")
         .expect("should provide the --ignored-dirs flag");
@@ -126,6 +126,7 @@ fn main() -> std::process::ExitCode {
         "Output format(github | editor) selected is: {:?}",
         output_format
     );
+    let debug = options.get("debug");
 
     let threads = get_threads_to_use(project_files.len() as u64);
     if threads.is_some() {
@@ -178,6 +179,9 @@ fn main() -> std::process::ExitCode {
         .iter()
         .flat_map(|p| parser::parse_file(p, BufReader::new(File::open(p).unwrap())))
         .collect();
+    if debug.is_some() {
+        println!("Comment dump: {:?}", comment_data_of_files);
+    }
     let end = Instant::now();
     //50k files in 13 seconds for the llvm project with some dirs excluded
     println!(
@@ -196,9 +200,14 @@ fn main() -> std::process::ExitCode {
     let should_regenerate_non_hashed_comments = options.get("regenerate");
     if should_regenerate_non_hashed_comments.is_some() {
         println!("Generating hashes for comments that dont already have them.");
+        let max_id = comment_data_of_files
+            .iter()
+            .map(|cm| cm.id)
+            .max()
+            .unwrap_or(0);
         let comments_per_file = group_comments_by_file(comment_data_of_files.iter());
         if let Err(e) =
-            source_code_replacer::regenerate_hashes_in_files(comments_per_file.into_iter())
+            source_code_replacer::regenerate_hashes_in_files(comments_per_file.into_iter(), max_id)
         {
             eprintln!("Something went wrong when generating the hashes for files: {e}");
         }
@@ -329,7 +338,7 @@ fn get_threads_to_use(files_to_process: u64) -> Option<usize> {
     let os = env::consts::OS;
     assert!(os == "linux");
     let meminfo_contents = fs::read_to_string(Path::new("/proc/meminfo")).unwrap();
-    //the records are in the form <label>:\t number kB ```comments-2.0 9 11249214323271872503 11249214323271872503```
+    //the records are in the form <label>:\t number kB ```comments-2.0 9 11249214323271872503 11249214323271872503 12```
     let available_memory = meminfo_contents
         .lines()
         .into_iter()
@@ -428,177 +437,11 @@ fn are_args_valid(args: &HashMap<String, String>) -> Result<(), &'static str> {
     return Ok(());
 }
 
-mod parser {
-    use crate::models::{CommentData, SourceLocation};
-
-    use std::io::prelude::*;
-    use std::path::Path;
-
-    fn project_folder() -> String {
-        return "".into();
-    }
-
-    #[derive(Debug, PartialEq)]
-    enum State {
-        Code,
-        SingleLineComment,
-        MultiLineComment,
-        ReadingReferencedCode { remaining: usize },
-    }
-
-    pub fn parse_file<T: BufRead>(file: &Path, reader: T) -> Vec<CommentData<'_>> {
-        let mut state = State::Code;
-        let mut current_comment = CommentData::empty();
-        current_comment.file = file;
-        let mut result = Vec::new();
-        let mut current_row = 0;
-
-        for line in reader.lines().flatten() {
-            current_row += 1;
-
-            // Calculate column (where non-whitespace starts)
-            let leading_whitespace = line.len() - line.trim_start().len();
-            let current_column = leading_whitespace;
-            let trimmed = line.trim_start();
-
-            match state {
-                State::Code => {
-                    if trimmed.starts_with("/*") {
-                        state = State::MultiLineComment;
-                        current_comment.comment_location.start.row = current_row;
-                        current_comment.comment_location.start.column = current_column;
-                        let ind = current_comment.push_comment(&trimmed["/*".len()..]);
-                        if ind.is_some() {
-                            let pos_in_comment = ind.unwrap();
-                            let pos_in_trimmed = "/*".len() + pos_in_comment;
-                            let pos_in_original_line = current_column as usize + pos_in_trimmed;
-                            current_comment.stamp_end = Some(SourceLocation {
-                                row: current_row,
-                                column: pos_in_original_line,
-                            });
-                        }
-                    } else if trimmed.starts_with("//") {
-                        state = State::SingleLineComment;
-                        current_comment.comment_location.start.row = current_row;
-                        current_comment.comment_location.start.column = current_column;
-                        let ind = current_comment.push_comment(&trimmed["//".len()..]);
-                        if ind.is_some() {
-                            let pos_in_comment = ind.unwrap();
-                            let pos_in_trimmed = "//".len() + pos_in_comment;
-                            let pos_in_original_line = current_column as usize + pos_in_trimmed;
-                            current_comment.stamp_end = Some(SourceLocation {
-                                row: current_row,
-                                column: pos_in_original_line,
-                            });
-                        }
-                    }
-                }
-
-                State::SingleLineComment => {
-                    if trimmed.starts_with("//") {
-                        let ind = current_comment.push_comment(&trimmed["//".len()..]);
-                        if ind.is_some() {
-                            let pos_in_comment = ind.unwrap();
-                            let pos_in_trimmed = "//".len() + pos_in_comment;
-                            let pos_in_original_line = current_column + pos_in_trimmed;
-                            current_comment.stamp_end = Some(SourceLocation {
-                                row: current_row,
-                                column: pos_in_original_line,
-                            });
-                        }
-                    } else {
-                        // Comment ended
-                        current_comment.comment_location.end.row = current_row - 1;
-                        let is_stamped = current_comment.lines_of_code_referenced > 0;
-
-                        if !is_stamped {
-                            result.push(current_comment);
-                            current_comment = CommentData::empty();
-                            current_comment.file = file;
-                            state = State::Code;
-                        } else {
-                            current_comment.push_code(trimmed);
-                            current_comment.lines_of_code_read = 1;
-
-                            if current_comment.lines_of_code_read
-                                == current_comment.lines_of_code_referenced
-                            {
-                                result.push(current_comment);
-                                current_comment = CommentData::empty();
-                                current_comment.file = file;
-                                state = State::Code;
-                            } else {
-                                state = State::ReadingReferencedCode {
-                                    remaining: current_comment.lines_of_code_referenced as usize
-                                        - 1,
-                                };
-                            }
-                        }
-                    }
-                }
-
-                State::MultiLineComment => {
-                    if trimmed.starts_with("*/") {
-                        current_comment.comment_location.end.row = current_row;
-                        current_comment.comment_location.end.column = current_column;
-                        let is_stamped = current_comment.lines_of_code_referenced > 0;
-
-                        if is_stamped {
-                            state = State::ReadingReferencedCode {
-                                remaining: current_comment.lines_of_code_referenced as usize,
-                            };
-                        } else {
-                            result.push(current_comment);
-                            current_comment = CommentData::empty();
-                            current_comment.file = file;
-                            state = State::Code;
-                        }
-                    } else {
-                        let ind = current_comment.push_comment(trimmed);
-                        if ind.is_some() {
-                            let pos_in_comment = ind.unwrap();
-                            let pos_in_original_line = current_column as usize + pos_in_comment;
-                            current_comment.stamp_end = Some(SourceLocation {
-                                row: current_row,
-                                column: pos_in_original_line,
-                            });
-                        }
-                    }
-                }
-
-                State::ReadingReferencedCode { remaining } => {
-                    current_comment.push_code(trimmed);
-                    current_comment.lines_of_code_read += 1;
-
-                    if remaining == 1 {
-                        result.push(current_comment);
-                        current_comment = CommentData::empty();
-                        current_comment.file = file;
-                        state = State::Code;
-                    } else {
-                        state = State::ReadingReferencedCode {
-                            remaining: remaining - 1,
-                        };
-                    }
-                }
-            }
-        }
-
-        // Handle trailing comment
-        if !current_comment.raw_contents.is_empty() {
-            result.push(current_comment);
-        }
-
-        result
-            .into_iter()
-            .filter(|comment| !comment.raw_contents.is_empty())
-            .collect()
-    }
-}
+mod parser;
 
 #[cfg(test)]
 mod tests {
-    mod parser {
+    mod parsertests {
 
         use crate::{
             models::{self, StampParseError},
@@ -653,7 +496,7 @@ console.log(`hello world`);
             assert!(modified_line.contains(&comment_hash));
             assert!(modified_line.contains(&code_hash));
 
-            // Verify the format is correct: ```comments-2.0 1 COMMENT_HASH CODE_HASH```
+            // Verify the format is correct: ```comments-2.0 0 COMMENT_HASH CODE_HASH```
             let expected_stamp = format!("```comments-2.0 1 {} {}```", comment_hash, code_hash);
             assert!(modified_line.contains(&expected_stamp));
 
@@ -800,11 +643,10 @@ console.log(`hello world`);
                     .raw_contents
                     .contains("that expands to multiple lines")
             );
-        }
 
-        #[test]
-        fn can_handle_all_types_of_comments() {
-            let file_contents = "// single line comment ```comments-2.0 1```
+            #[test]
+            fn can_handle_all_types_of_comments() {
+                let file_contents = "// single line comment ```comments-2.0 1```
 console.log(`hello world`)
 
 //group of single line comments
@@ -822,36 +664,36 @@ console.log(`Line 3`)
 console.log(`Line 4`)
 ";
 
-            let result = parse_file_helper(file_contents);
+                let result = parse_file_helper(file_contents);
 
-            assert_eq!(result.len(), 3);
+                assert_eq!(result.len(), 3);
 
-            for comment in result {
-                println!("Comment: {}", &comment.code_it_refers_to);
-                let has_code =
-                    comment.lines_of_code_referenced > 0 && comment.code_it_refers_to.len() > 0;
-                let has_comment = comment.raw_contents.len() > 0;
-                let has_file_path = comment.file.to_str().unwrap().len() > 0;
-                assert!(has_comment && has_file_path);
+                for comment in result {
+                    println!("Comment: {}", &comment.code_it_refers_to);
+                    let has_code =
+                        comment.lines_of_code_referenced > 0 && comment.code_it_refers_to.len() > 0;
+                    let has_comment = comment.raw_contents.len() > 0;
+                    let has_file_path = comment.file.to_str().unwrap().len() > 0;
+                    assert!(has_comment && has_file_path);
+                }
             }
-        }
 
-        #[test]
-        fn ignores_inline_comments() {
-            let file_contents =
-                "console.log(`Hello World`); //this prints hello world to the console";
-            let extra_example = "console.log(/* args: */ `Hello World`);";
-            let result = parse_file_helper(file_contents);
+            #[test]
+            fn ignores_inline_comments() {
+                let file_contents =
+                    "console.log(`Hello World`); //this prints hello world to the console";
+                let extra_example = "console.log(/* args: */ `Hello World`);";
+                let result = parse_file_helper(file_contents);
 
-            let result_for_comment_inside_code = parse_file_helper(extra_example);
+                let result_for_comment_inside_code = parse_file_helper(extra_example);
 
-            assert!(result_for_comment_inside_code.len() == 0);
-            assert!(result.len() == 0);
-        }
+                assert!(result_for_comment_inside_code.len() == 0);
+                assert!(result.len() == 0);
+            }
 
-        #[test]
-        fn empty_comments_should_be_detected() {
-            let file_contents = "// single line comment ```comments-2.0 1```
+            #[test]
+            fn empty_comments_should_be_detected() {
+                let file_contents = "// single line comment ```comments-2.0 1```
 console.log(`hello world`)
 
 //group of single line comments
@@ -871,14 +713,16 @@ console.log(`Line 4`)
 //
 ";
 
-            let result = parse_file_helper(file_contents);
-            assert_eq!(result.len(), 4);
-            assert!(result.iter().all(|comment| comment.raw_contents.len() > 0));
+                let result = parse_file_helper(file_contents);
+                assert_eq!(result.len(), 4);
+                assert!(result.iter().all(|comment| comment.raw_contents.len() > 0));
+            }
         }
+        // #[test]
+        // fn rejects_invalid_arguments() {
+        //     //this can also be a test-doc how's it called in rust
+        //     todo!();
+        // }
     }
-    // #[test]
-    // fn rejects_invalid_arguments() {
-    //     //this can also be a test-doc how's it called in rust
-    //     todo!();
-    // }
 }
+

@@ -44,7 +44,7 @@ impl Storage for SqliteDB {
                 );
 
                 //i dont like the created_at timestamp it is useless, it should have an author
-                //instead and a time of change ```comments-2.0 1 12772118682245448942 12772118682245448942```
+                //instead and a time of change ```comments-2.0 1 11121425946914068076 11121425946914068076 1```
                 let initialize_db_command = conn.prepare(
                     "
 CREATE TABLE IF NOT EXISTS Comments(
@@ -76,10 +76,10 @@ CREATE TABLE IF NOT EXISTS Comments(
                     return Err(res.err().unwrap().to_string());
                 }
                 //the chunk size is 100 arbitrarily, to avoid long uncommitted transactions
-                //```comments-2.0 1 16704368689317473269 16704368689317473269```
+                //```comments-2.0 1 2721008811120258382 2721008811120258382 2```
                 for chunk in data.chunks(records_per_transaction) {
                     //i manually start and stop the transaction in order to
-                    //make it faster by avoiding too many transactions ```comments-2.0 1 6643353057262408975 6643353057262408975```
+                    //make it faster by avoiding too many transactions ```comments-2.0 1 11498519354683682872 11498519354683682872 3```
                     let tx = conn.transaction().unwrap();
                     {
                         let mut stmt = tx
