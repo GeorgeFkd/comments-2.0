@@ -86,21 +86,24 @@ impl<'a> RuleViolationOnFile<'a> {
 fn format_violation(output_format: &str, level: &str, comment: &CommentData, msg: &str) -> String {
     match output_format {
         "github" => format!(
-            "::{} file={},line={},col={}::{}",
+            "::{} file={},line={},col={}::{} deps: {:?}",
             level,
             comment.file.display(),
             comment.comment_location.start.row,
             comment.comment_location.start.column,
-            msg
+            msg,
+            comment.dependency_list_parsed
         ),
         "editor" => format!(
-            "{}:{}:{}: {}: {}",
+            "{}:{}:{}: {}: {} deps: {:?} comment {:?}...",
             comment.file.display(),
             comment.comment_location.start.row,
-            //the cursor is at a slightly wrong place this is a temp fix ```comments-2.0 1```
+            //the cursor is at a slightly wrong place this is a temp fix ```comments-2.0 1 4395583177411532991 4395583177411532991```
             comment.comment_location.start.column + 1,
             level,
-            msg
+            msg,
+            comment.dependency_list_parsed,
+            comment.raw_contents
         ),
         _ => format!("Not a valid output format {output_format}"),
     }
@@ -135,7 +138,7 @@ pub enum CommentIntegrityRuleViolations {
     CommentThatOthersDependOnDeleted,
 }
 
-//this function will be configurable to return success/failure based on user input ```comments-2.0 16```
+//this function will be configurable to return success/failure based on user input ```comments-2.0 16 14130792760320861292 14130792760320861292```
 pub fn determine_exit_code(violations: &[RuleViolationOnFile]) -> std::process::ExitCode {
     if violations.is_empty() {
         return std::process::ExitCode::SUCCESS;
@@ -206,3 +209,4 @@ pub fn generate_violations_from_comments<'a>(
         .filter_map(get_violation)
         .collect()
 }
+

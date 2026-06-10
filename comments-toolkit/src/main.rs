@@ -67,10 +67,6 @@ fn get_changed_files_from_git(file_extensions: &[String]) -> HashSet<PathBuf> {
     let output = String::from_utf8(output.stdout).unwrap();
     println!("Git output: {}", &output);
     println!("File extensions: {:?}", file_extensions);
-    println!(
-        "Contains: {:?}",
-        file_extensions.contains(&"rs".to_string())
-    );
     output
         .lines()
         .map(PathBuf::from)
@@ -122,6 +118,14 @@ fn main() -> std::process::ExitCode {
         &ignored_dirs,
         &file_extensions,
     );
+    let output_format = options
+        .get("output-format")
+        .map(String::as_str)
+        .unwrap_or("github");
+    println!(
+        "Output format(github | editor) selected is: {:?}",
+        output_format
+    );
 
     let threads = get_threads_to_use(project_files.len() as u64);
     if threads.is_some() {
@@ -166,6 +170,10 @@ fn main() -> std::process::ExitCode {
         }
     };
     println!("Will process {} project files", files_to_process.len());
+    let _ = files_to_process
+        .iter()
+        .take(5)
+        .for_each(|f| println!("File: {:?}", f));
     let comment_data_of_files: Vec<models::CommentData> = files_to_process
         .iter()
         .flat_map(|p| parser::parse_file(p, BufReader::new(File::open(p).unwrap())))
@@ -179,12 +187,6 @@ fn main() -> std::process::ExitCode {
     );
 
     let violations = violations::generate_violations_from_comments(&comment_data_of_files);
-
-    let output_format = options
-        .get("output-format")
-        .map(String::as_str)
-        .unwrap_or("github");
-    println!("Output format selected is: {:?}", output_format);
 
     println!(
         "=====Violations =======\n {} ",
