@@ -129,7 +129,7 @@ impl<'a> CommentData<'a> {
         }
 
         if position_of_comment_deps != 0 {
-            //If this is slow the parse_num_list is at fault: ```comments-2.0 5 8442626637817291417, 6529248524142715448 6529248524142715448 1```
+            //If this is slow the parse_num_list is at fault: ```comments-2.0 5 6-8442626637817291417, 6529248524142715448 6529248524142715448 1```
             let dependency_list_string = data.get(position_of_comment_deps);
             self.dependency_list_parsed = match dependency_list_string {
                 None => vec![],

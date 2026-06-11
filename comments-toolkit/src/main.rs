@@ -96,6 +96,22 @@ fn main() -> std::process::ExitCode {
         }
     }
 
+    //this is done way before it is needed so we can fail fast ```comments-2.0 1```
+    let levels_config_file = options.get("levels-file").map(String::from);
+    let violation_checker = match levels_config_file.clone() {
+        None => Ok(violations::ViolationChecker::default()),
+        Some(file_path) => violations::ViolationChecker::with_config_file(file_path),
+    };
+    let violation_checker = violation_checker
+        .inspect_err(|e| {
+            eprintln!(
+                "Something went wrong when loading config from file {}. Error: {}",
+                levels_config_file.unwrap(),
+                e
+            )
+        })
+        .unwrap();
+
     let file_extensions = options
         .get("file-extensions")
         .expect("should provide the --file-extensions flag");
@@ -190,11 +206,11 @@ fn main() -> std::process::ExitCode {
         end.duration_since(start)
     );
 
-    let violations = violations::generate_violations_from_comments(&comment_data_of_files);
+    let violations = violation_checker.generate_violations_from_comments(&comment_data_of_files);
 
     println!(
         "=====Violations =======\n {} ",
-        violations::display_violations_to_user(violations.as_slice(), output_format)
+        violation_checker.display_violations_to_user(violations.as_slice(), output_format)
     );
 
     let should_regenerate_non_hashed_comments = options.get("regenerate");
@@ -217,7 +233,7 @@ fn main() -> std::process::ExitCode {
         println!("Not generating hashes for comments that dont already have them.");
     }
 
-    return violations::determine_exit_code(violations.as_slice());
+    return violation_checker.determine_exit_code(violations.as_slice());
     // let result = comment_data_of_files.len();
     // println!("The project comments are: {}\n", result);
     // let db_option = options.get("db");
