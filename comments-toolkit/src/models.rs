@@ -45,6 +45,14 @@ pub struct CommentData<'a> {
     pub id: u64,
 }
 
+impl<'a> PartialEq for CommentData<'a> {
+    fn eq(&self, other: &Self) -> bool {
+        //might need to add hashes and deps comparison
+        return self.raw_contents == other.raw_contents
+            && self.code_it_refers_to == self.code_it_refers_to;
+    }
+}
+impl Eq for CommentData<'_> {}
 impl<'a> CommentData<'a> {
     pub fn empty() -> Self {
         Self {
@@ -259,7 +267,7 @@ impl<'a> CommentData<'a> {
         //might need to implement a custom one at some point ```comments-2.0 1 12266695676757476950 12266695676757476950 9```
         let mut state = DefaultHasher::new();
         let normalized: Vec<String> = self
-            .raw_contents
+            .code_it_refers_to
             .split_whitespace() // split into words
             .map(|word| {
                 word.chars()
@@ -437,4 +445,3 @@ hello there */
         assert_eq!(cm.code_hash_parsed, "defg");
     }
 }
-

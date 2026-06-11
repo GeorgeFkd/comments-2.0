@@ -441,22 +441,33 @@ mod parser;
 
 #[cfg(test)]
 mod tests {
-    mod parsertests {
 
-        use crate::{
-            models::{self, StampParseError},
-            parser::parse_file,
-            source_code_replacer::with_multiple_added_content_at,
-        };
-
+    mod helpers {
         use std::{io::BufReader, path::Path};
 
-        fn parse_file_helper(file_contents: &str) -> Vec<models::CommentData<'_>> {
+        use crate::{models, parser::parse_file};
+
+        pub fn parse_file_helper(file_contents: &str) -> Vec<models::CommentData<'_>> {
             parse_file(
                 Path::new("a_random_file.js"),
                 BufReader::new(file_contents.as_bytes()),
             )
         }
+    }
+
+    mod integration_tests {
+        use std::io::BufReader;
+
+        use crate::{
+            models::StampParseError, source_code_replacer::with_multiple_added_content_at,
+            tests::helpers::parse_file_helper,
+        };
+
+        #[test]
+        fn comment_that_triggered_violation_for_code_or_comment_changes_doesnt_trigger_it_after_regeneration()
+         {
+        }
+
         #[test]
         fn insert_hashes_at_stamp_end_position() {
             let file_contents = "//This is a comment ```comments-2.0 1```
@@ -548,6 +559,23 @@ console.log(`hello world`);
                 stamp_end.row, stamp_end.column
             );
             println!("Should insert hashes between '1' and '```'");
+        }
+    }
+
+    mod parsertests {
+
+        use crate::{
+            models::{self},
+            parser::parse_file,
+        };
+
+        use std::{io::BufReader, path::Path};
+
+        fn parse_file_helper(file_contents: &str) -> Vec<models::CommentData<'_>> {
+            parse_file(
+                Path::new("a_random_file.js"),
+                BufReader::new(file_contents.as_bytes()),
+            )
         }
 
         #[test]
@@ -725,4 +753,3 @@ console.log(`Line 4`)
         // }
     }
 }
-
