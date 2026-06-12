@@ -1,7 +1,6 @@
 use std::{
     hash::{DefaultHasher, Hash, Hasher},
     path::Path,
-    sync::Mutex,
 };
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StampParseError {
@@ -48,8 +47,7 @@ pub struct CommentData<'a> {
 impl<'a> PartialEq for CommentData<'a> {
     fn eq(&self, other: &Self) -> bool {
         //might need to add hashes and deps comparison
-        return self.raw_contents == other.raw_contents
-            && self.code_it_refers_to == self.code_it_refers_to;
+        self.raw_contents == other.raw_contents && self.code_it_refers_to == other.code_it_refers_to
     }
 }
 impl Eq for CommentData<'_> {}
@@ -62,7 +60,7 @@ impl<'a> CommentData<'a> {
                 end: SourceLocation::empty(),
             },
             raw_contents: "".into(),
-            file: &Path::new(""),
+            file: Path::new(""),
             code_it_refers_to: "".into(),
             lines_of_code_referenced: 0,
             lines_of_code_read: 0,
@@ -76,7 +74,7 @@ impl<'a> CommentData<'a> {
     }
 
     pub fn generate_next_id(prev: u64) -> u64 {
-        return prev + 1;
+        prev + 1
     }
 
     /* Basically the model is:
@@ -85,7 +83,7 @@ impl<'a> CommentData<'a> {
      * so the stamp with autogen has either 4 or 5 elems if the autogen has ran
      * and either 1 or 2 elems if the auto gen has not run
      */
-    fn consume_stamp(&mut self, stamp_contents: &str) -> () {
+    fn consume_stamp(&mut self, stamp_contents: &str) {
         let data: Vec<&str> = stamp_contents.split(" ").collect();
         //TODO: First the user specified stuff and then the rest
         //TODO: A comment not having hashes is not an error specifically it is just that it hasnt
@@ -97,13 +95,11 @@ impl<'a> CommentData<'a> {
         };
         self.parse_error = parse_error.clone();
 
-        let lines_referenced = data.get(0).unwrap();
-        let parsed_num = lines_referenced.parse().expect(&format!(
-            "Could not parse the lines of code number of the ```comments-2.0 ``` stamp at {}:{}:{}",
+        let lines_referenced = data.first().unwrap();
+        let parsed_num = lines_referenced.parse().unwrap_or_else(|_| panic!("Could not parse the lines of code number of the ```comments-2.0 ``` stamp at {}:{}:{}",
             self.file.display(),
             self.comment_location.start.row,
-            self.comment_location.start.column
-        ));
+            self.comment_location.start.column));
         self.lines_of_code_referenced = parsed_num;
         //user wants us to ignore this comment ```comments-2.0 3 10594047134962409199 10594047134962409199 4```
         if parsed_num == 0 {
@@ -161,8 +157,6 @@ impl<'a> CommentData<'a> {
         self.id = comment_id
             .parse()
             .expect("Comment ID could not be parsed into a number");
-
-        return;
     }
 
     pub fn push_comment(&mut self, string: &str) -> Option<usize> {
@@ -178,7 +172,7 @@ impl<'a> CommentData<'a> {
             None => {
                 self.raw_contents.push('\n');
                 self.raw_contents.push_str(string);
-                return None;
+                None
             }
 
             Some(start) => {
@@ -199,7 +193,7 @@ impl<'a> CommentData<'a> {
                 self.consume_stamp(stamp_slice);
                 // println!("Stamp slice is: {:?}", stamp_slice);
 
-                return Some(start + open_pattern.len() + stamp_end.unwrap());
+                Some(start + open_pattern.len() + stamp_end.unwrap())
             }
         }
     }
@@ -234,7 +228,7 @@ fn parse_num_tuple_list_from_str(str: &str) -> Vec<(u64, String)> {
             nums[1].to_owned(),
         ));
     }
-    return tuples;
+    tuples
 }
 
 impl<'a> CommentData<'a> {
@@ -258,7 +252,7 @@ impl<'a> CommentData<'a> {
         }
 
         self.file.hash(&mut state);
-        return state.finish().to_string();
+        state.finish().to_string()
     }
 
     //using only the code contents and the filename, also the content should first be split into
@@ -282,7 +276,7 @@ impl<'a> CommentData<'a> {
         }
 
         self.file.hash(&mut state);
-        return state.finish().to_string();
+        state.finish().to_string()
     }
 }
 

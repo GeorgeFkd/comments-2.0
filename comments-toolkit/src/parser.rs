@@ -4,7 +4,7 @@ use std::io::prelude::*;
 use std::path::Path;
 
 fn project_folder() -> String {
-    return "".into();
+    "".into()
 }
 
 #[derive(Debug, PartialEq)]
@@ -22,7 +22,7 @@ pub fn parse_file<T: BufRead>(file: &Path, reader: T) -> Vec<CommentData<'_>> {
     let mut result = Vec::new();
     let mut current_row = 0;
 
-    for line in reader.lines().flatten() {
+    for line in reader.lines().map_while(Result::ok) {
         current_row += 1;
 
         // Calculate column (where non-whitespace starts)
@@ -32,29 +32,27 @@ pub fn parse_file<T: BufRead>(file: &Path, reader: T) -> Vec<CommentData<'_>> {
 
         match state {
             State::Code => {
-                if trimmed.starts_with("/*") {
+                if let Some(stripped) = trimmed.strip_prefix("/*") {
                     state = State::MultiLineComment;
                     current_comment.comment_location.start.row = current_row;
                     current_comment.comment_location.start.column = current_column;
-                    let ind = current_comment.push_comment(&trimmed["/*".len()..]);
-                    if ind.is_some() {
-                        let pos_in_comment = ind.unwrap();
+                    let ind = current_comment.push_comment(stripped);
+                    if let Some(pos_in_comment) = ind {
                         let pos_in_trimmed = "/*".len() + pos_in_comment;
-                        let pos_in_original_line = current_column as usize + pos_in_trimmed;
+                        let pos_in_original_line = current_column + pos_in_trimmed;
                         current_comment.stamp_end = Some(SourceLocation {
                             row: current_row,
                             column: pos_in_original_line,
                         });
                     }
-                } else if trimmed.starts_with("//") {
+                } else if let Some(stripped) = trimmed.strip_prefix("//") {
                     state = State::SingleLineComment;
                     current_comment.comment_location.start.row = current_row;
                     current_comment.comment_location.start.column = current_column;
-                    let ind = current_comment.push_comment(&trimmed["//".len()..]);
-                    if ind.is_some() {
-                        let pos_in_comment = ind.unwrap();
+                    let ind = current_comment.push_comment(stripped);
+                    if let Some(pos_in_comment) = ind {
                         let pos_in_trimmed = "//".len() + pos_in_comment;
-                        let pos_in_original_line = current_column as usize + pos_in_trimmed;
+                        let pos_in_original_line = current_column + pos_in_trimmed;
                         current_comment.stamp_end = Some(SourceLocation {
                             row: current_row,
                             column: pos_in_original_line,
@@ -64,10 +62,9 @@ pub fn parse_file<T: BufRead>(file: &Path, reader: T) -> Vec<CommentData<'_>> {
             }
 
             State::SingleLineComment => {
-                if trimmed.starts_with("//") {
-                    let ind = current_comment.push_comment(&trimmed["//".len()..]);
-                    if ind.is_some() {
-                        let pos_in_comment = ind.unwrap();
+                if let Some(stripped) = trimmed.strip_prefix("//") {
+                    let ind = current_comment.push_comment(stripped);
+                    if let Some(pos_in_comment) = ind {
                         let pos_in_trimmed = "//".len() + pos_in_comment;
                         let pos_in_original_line = current_column + pos_in_trimmed;
                         current_comment.stamp_end = Some(SourceLocation {
@@ -123,9 +120,8 @@ pub fn parse_file<T: BufRead>(file: &Path, reader: T) -> Vec<CommentData<'_>> {
                     }
                 } else {
                     let ind = current_comment.push_comment(trimmed);
-                    if ind.is_some() {
-                        let pos_in_comment = ind.unwrap();
-                        let pos_in_original_line = current_column as usize + pos_in_comment;
+                    if let Some(pos_in_comment) = ind {
+                        let pos_in_original_line = current_column + pos_in_comment;
                         current_comment.stamp_end = Some(SourceLocation {
                             row: current_row,
                             column: pos_in_original_line,

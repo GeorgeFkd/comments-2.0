@@ -31,31 +31,31 @@ fn collect_hash_insertions(
     comments: &[&CommentData],
     last_id: u64,
 ) -> (Vec<(usize, usize, String)>, u64) {
-    let mut current_id = last_id.clone();
+    let mut current_id = last_id;
     let result = comments
         .iter()
         .filter(|c| !c.should_be_ignored)
         .filter_map(|comment| {
-            if let Some(StampParseError::StampWithoutHashes) = comment.parse_error {
-                if let Some(ref stamp_end) = comment.stamp_end {
-                    let comment_id = CommentData::generate_next_id(current_id);
-                    current_id = comment_id.clone();
-                    return Some((
-                        stamp_end.row - 1,
-                        stamp_end.column,
-                        format!(
-                            " {} {} {}",
-                            comment.hash_comment(),
-                            comment.hash_code(),
-                            comment_id
-                        ),
-                    ));
-                }
+            if let Some(StampParseError::StampWithoutHashes) = comment.parse_error
+                && let Some(ref stamp_end) = comment.stamp_end
+            {
+                let comment_id = CommentData::generate_next_id(current_id);
+                current_id = comment_id;
+                return Some((
+                    stamp_end.row - 1,
+                    stamp_end.column,
+                    format!(
+                        " {} {} {}",
+                        comment.hash_comment(),
+                        comment.hash_code(),
+                        comment_id
+                    ),
+                ));
             }
             None
         })
         .collect();
-    return (result, current_id);
+    (result, current_id)
 }
 
 fn apply_hash_insertions(
@@ -129,7 +129,6 @@ pub fn with_multiple_added_content_at<T: BufRead>(
         // Check if we have a change for this row
         if change_idx < sorted_changes.len() && sorted_changes[change_idx].0 == current_row {
             let (_, col, content) = sorted_changes[change_idx];
-            let col = col as usize;
 
             // Insert content at the specified column
             let mut modified_line = String::new();

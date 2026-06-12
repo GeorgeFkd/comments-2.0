@@ -8,7 +8,7 @@ use std::time::Instant;
 use std::{env, fs};
 mod models;
 
-use crate::models::{CommentData, StampParseError};
+use crate::models::CommentData;
 use crate::violations::RuleViolationOnFile;
 mod source_code_replacer;
 //General Notes:
@@ -51,17 +51,14 @@ fn group_comments_by_file<'a>(
 ) -> HashMap<&'a Path, Vec<&'a CommentData<'a>>> {
     let mut result: HashMap<&Path, Vec<&CommentData>> = HashMap::new();
     comments.for_each(|comment| {
-        result
-            .entry(comment.file)
-            .or_insert_with(Vec::new)
-            .push(comment);
+        result.entry(comment.file).or_default().push(comment);
     });
     result
 }
 
 fn get_changed_files_from_git(file_extensions: &[String]) -> HashSet<PathBuf> {
     let output = std::process::Command::new("git")
-        .args(&["diff", "--name-only", "HEAD"])
+        .args(["diff", "--name-only", "HEAD"])
         .output()
         .expect("Failed to run git diff");
     let output = String::from_utf8(output.stdout).unwrap();
@@ -86,7 +83,7 @@ fn main() -> std::process::ExitCode {
         .inspect_err(|e| eprintln!("Error while parsing args: {e}"))
         .unwrap();
 
-    assert!(options.len() > 0);
+    assert!(!options.is_empty());
 
     match are_args_valid(&options) {
         Ok(()) => println!("Check: Arguments are valid"),
@@ -145,8 +142,8 @@ fn main() -> std::process::ExitCode {
     let debug = options.get("debug");
 
     let threads = get_threads_to_use(project_files.len() as u64);
-    if threads.is_some() {
-        println!("Will use {} threads", threads.unwrap());
+    if let Some(threads) = threads {
+        println!("Will use {} threads", threads);
     } else {
         println!("Will be single threaded")
     }
@@ -166,14 +163,14 @@ fn main() -> std::process::ExitCode {
                     .filter(|p| {
                         let p_str = p.to_string_lossy();
                         let p_clean = p_str.strip_prefix("./").unwrap_or(&p_str);
-                        let res = changed_files
+
+                        changed_files
                             .iter()
-                            .any(|cf| cf.to_string_lossy().ends_with(p_clean));
-                        return res;
+                            .any(|cf| cf.to_string_lossy().ends_with(p_clean))
                     })
                     .collect()
-            } else if filter_choice.starts_with("file=") {
-                let specified_files: HashSet<PathBuf> = filter_choice["file=".len()..]
+            } else if let Some(selected_files) = filter_choice.strip_prefix("file=") {
+                let specified_files: HashSet<PathBuf> = selected_files
                     .split(',')
                     .map(|s| PathBuf::from(s.trim()))
                     .collect();
@@ -187,7 +184,7 @@ fn main() -> std::process::ExitCode {
         }
     };
     println!("Will process {} project files", files_to_process.len());
-    let _ = files_to_process
+    files_to_process
         .iter()
         .take(5)
         .for_each(|f| println!("File: {:?}", f));
@@ -233,7 +230,7 @@ fn main() -> std::process::ExitCode {
         println!("Not generating hashes for comments that dont already have them.");
     }
 
-    return violation_checker.determine_exit_code(violations.as_slice());
+    violation_checker.determine_exit_code(violations.as_slice())
     // let result = comment_data_of_files.len();
     // println!("The project comments are: {}\n", result);
     // let db_option = options.get("db");
@@ -367,13 +364,13 @@ fn get_threads_to_use(files_to_process: u64) -> Option<usize> {
         .unwrap();
     let available_memory: Vec<&str> = available_memory.trim_start().split(" ").collect();
     let available_memory: usize = available_memory
-        .get(0)
+        .first()
         .unwrap()
         .parse()
         .expect("Could not parse /proc/meminfo file");
     println!("System has {available_memory} kB memory");
 
-    return Some(threads);
+    Some(threads)
 }
 
 fn get_files_from_directory_recursively(
@@ -384,12 +381,12 @@ fn get_files_from_directory_recursively(
     //the performance might be bad
     assert!(dir.is_dir());
     match read_dir(dir) {
-        Err(e) => vec![],
+        Err(_e) => vec![],
         Ok(entries) => entries
             .filter(|p| p.is_ok())
             .flat_map(|p| {
                 let p = p.unwrap().path();
-                let last_path = p.as_path().iter().last().unwrap().to_str().unwrap();
+                let last_path = p.as_path().iter().next_back().unwrap().to_str().unwrap();
                 match p.is_dir()
                     && !ignored_dirs.contains(&last_path.to_owned())
                     && !last_path.starts_with(".")
@@ -401,12 +398,12 @@ fn get_files_from_directory_recursively(
                     ),
                     false => {
                         let mut result = vec![];
-                        if let Some(v) = p.extension() {
-                            if file_extensions_allowed.contains(&v.to_str().unwrap().to_owned()) {
-                                result.push(p);
-                            }
+                        if let Some(v) = p.extension()
+                            && file_extensions_allowed.contains(&v.to_str().unwrap().to_owned())
+                        {
+                            result.push(p);
                         }
-                        return result;
+                        result
                     }
                 }
             })
@@ -418,7 +415,7 @@ fn parse_program_args(args: Args) -> Result<HashMap<String, String>, String> {
     //the format is: --<argname1><space><value><space>--<argname2>
     //no need for a library
 
-    let mut args: Vec<String> = args.collect();
+    let args: Vec<String> = args.collect();
     if args.len() == 1 {
         let help_msg = format!(
             "No arguments passed to executable, the help can be seen here: \n {}",
@@ -427,11 +424,11 @@ fn parse_program_args(args: Args) -> Result<HashMap<String, String>, String> {
         return Err(help_msg);
     }
 
-    let mut args = args.into_iter();
+    let args = args.into_iter();
 
     let mut result = HashMap::new();
     args.skip(1)
-        .reduce(|acc, s| return String::from(acc) + " " + &s)
+        .reduce(|acc, s| acc + " " + &s)
         .expect("It was previously checked that we have enough arguments")
         .split("--")
         .skip(1)
@@ -445,12 +442,12 @@ fn parse_program_args(args: Args) -> Result<HashMap<String, String>, String> {
             };
         });
 
-    return Ok(result);
+    Ok(result)
 }
 
-fn are_args_valid(args: &HashMap<String, String>) -> Result<(), &'static str> {
+fn are_args_valid(_args: &HashMap<String, String>) -> Result<(), &'static str> {
     //this is just some business logic for validating mutually exclusive params etc. etc.
-    return Ok(());
+    Ok(())
 }
 
 mod parser;

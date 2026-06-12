@@ -109,7 +109,7 @@ impl ViolationChecker {
             format_violation(
                 output_format,
                 level.as_str(),
-                &file_violation.comment,
+                file_violation.comment,
                 &message,
             ),
             level.as_str().to_owned(),
@@ -223,7 +223,7 @@ impl ViolationChecker {
         if !code_hash_is_updated && comment_hash_is_updated {
             return HashCheckResult::CodeHashNotUpToDate;
         }
-        return HashCheckResult::BothHashesInvalid;
+        HashCheckResult::BothHashesInvalid
     }
 
     pub fn determine_exit_code(
@@ -272,11 +272,11 @@ impl ViolationChecker {
     ) -> Vec<RuleViolationOnFile<'a>> {
         let mut violations_within_comment: Vec<RuleViolationOnFile<'_>> = comments_of_project
             .iter()
-            .filter_map(|cm| self.get_violation(&cm))
+            .filter_map(|cm| self.get_violation(cm))
             .collect();
         let violations_between_comments = self.get_dependecy_violations(comments_of_project);
         violations_within_comment.extend(violations_between_comments);
-        return violations_within_comment;
+        violations_within_comment
     }
 
     fn get_dependecy_violations<'a>(
@@ -285,7 +285,7 @@ impl ViolationChecker {
     ) -> Vec<RuleViolationOnFile<'a>> {
         let comments_with_dependencies = comments_of_project
             .iter()
-            .filter(|cm| cm.dependency_list_parsed.len() > 0);
+            .filter(|cm| !cm.dependency_list_parsed.is_empty());
         let mut result = vec![];
         for cm_with_deps in comments_with_dependencies {
             for dep in cm_with_deps.dependency_list_parsed.iter() {
@@ -302,8 +302,8 @@ impl ViolationChecker {
                         comment: cm_with_deps,
                         violation: CommentIntegrityRuleViolations::DependsOnCommentThatDoesntExist,
                     });
-                } else {
-                    if dep.1 != found.unwrap().comment_hash_parsed {
+                } else if let Some(found) = found {
+                    if dep.1 != found.comment_hash_parsed {
                         result.push(RuleViolationOnFile {
                             comment: cm_with_deps,
                             violation: CommentIntegrityRuleViolations::DependsOnCommentThatChanged,
@@ -314,13 +314,11 @@ impl ViolationChecker {
                 }
             }
         }
-        return result;
+        result
     }
 }
 
-fn violation_to_message<'a>(
-    violation: &'a CommentIntegrityRuleViolations,
-) -> (ViolationLevel, String) {
+fn violation_to_message(violation: &CommentIntegrityRuleViolations) -> (ViolationLevel, String) {
     match violation {
         CommentIntegrityRuleViolations::CommentDoesNotReferenceSpecificCode => (
             ViolationLevel::Warning,
@@ -331,11 +329,11 @@ fn violation_to_message<'a>(
         }
         CommentIntegrityRuleViolations::CodeChangedCommentNot => (
             ViolationLevel::Error,
-            format!("Code hash changed but comment was not updated",),
+            "Code hash changed but comment was not updated".to_string(),
         ),
         CommentIntegrityRuleViolations::CommentHashNotRegenerated => (
             ViolationLevel::Warning,
-            format!("Comment hash needs regeneration",),
+            "Comment hash needs regeneration".to_string(),
         ),
         CommentIntegrityRuleViolations::CommentThatOthersDependOnChanged => (
             ViolationLevel::Error,
@@ -513,7 +511,7 @@ fn get_dependecy_violations<'a>(
 ) -> Vec<RuleViolationOnFile<'a>> {
     let comments_with_dependencies = comments_of_project
         .iter()
-        .filter(|cm| cm.dependency_list_parsed.len() > 0);
+        .filter(|cm| !cm.dependency_list_parsed.is_empty());
     let mut result = vec![];
     for cm_with_deps in comments_with_dependencies {
         for dep in cm_with_deps.dependency_list_parsed.iter() {
@@ -530,8 +528,8 @@ fn get_dependecy_violations<'a>(
                     comment: cm_with_deps,
                     violation: CommentIntegrityRuleViolations::DependsOnCommentThatDoesntExist,
                 });
-            } else {
-                if dep.1 != found.unwrap().comment_hash_parsed {
+            } else if let Some(found) = found {
+                if dep.1 != found.comment_hash_parsed {
                     result.push(RuleViolationOnFile {
                         comment: cm_with_deps,
                         violation: CommentIntegrityRuleViolations::DependsOnCommentThatChanged,
@@ -542,7 +540,7 @@ fn get_dependecy_violations<'a>(
             }
         }
     }
-    return result;
+    result
 }
 
 // pub fn generate_violations_from_comments<'a>(

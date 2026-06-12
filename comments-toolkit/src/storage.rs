@@ -9,7 +9,7 @@ pub struct SqliteDB {
 
 impl SqliteDB {
     pub fn new(file: PathBuf) -> Self {
-        return Self { file };
+        Self { file }
     }
 }
 
@@ -36,7 +36,7 @@ impl Storage for SqliteDB {
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         );
         match conn {
-            Err(e) => return Err(e.to_string()),
+            Err(e) => Err(e.to_string()),
             Ok(mut conn) => {
                 println!(
                     "A connection was successfully made in {}\n ",
@@ -64,7 +64,7 @@ CREATE TABLE IF NOT EXISTS Comments(
                     .expect("Something went wrong when trying to create tables")
                     .execute([]);
 
-                let mut index_initialisation = conn.prepare(
+                let index_initialisation = conn.prepare(
                     "CREATE INDEX IF NOT EXISTS idx_comments_file_path ON Comments(file_path);",
                 );
 
@@ -110,7 +110,7 @@ CREATE TABLE IF NOT EXISTS Comments(
                     }
                     tx.commit().unwrap();
                 }
-                return Ok(());
+                Ok(())
             }
         }
     }
@@ -144,10 +144,10 @@ CREATE TABLE IF NOT EXISTS Comments(
         ])
         .expect("Something went wrong when trying to execute an INSERT statement");
         println!("inserted one record into db");
-        return Ok(());
+        Ok(())
     }
 
-    fn read_all(&self) -> Vec<models::CommentData> {
+    fn read_all(&self) -> Vec<models::CommentData<'_>> {
         todo!();
     }
 
@@ -170,19 +170,19 @@ CREATE TABLE IF NOT EXISTS Comments(
 
 pub trait Storage {
     //i might need to make this async in the future or just throw it in a different thread
-    fn store(&self, data: &models::CommentData) -> Result<(), String> {
-        return Ok(());
+    fn store(&self, _data: &models::CommentData) -> Result<(), String> {
+        Ok(())
     }
 
     fn store_batch(
         &self,
-        data: &Vec<models::CommentData>,
-        records_per_transaction: usize,
+        _data: &Vec<models::CommentData>,
+        _records_per_transaction: usize,
     ) -> Result<(), String> {
         Ok(())
     }
 
-    fn read_all(&self) -> Vec<models::CommentData> {
+    fn read_all(&self) -> Vec<models::CommentData<'_>> {
         todo!();
     }
 
