@@ -194,11 +194,11 @@ pub trait Storage {
         todo!();
     }
 
-    fn dump_contents_human_readable(&self) -> String {
+    fn raw_contents(&self) -> String {
         todo!();
     }
 
-    fn raw_contents(&self) -> String {
+    fn dump_contents_human_readable(&self) -> String {
         todo!();
     }
 }
